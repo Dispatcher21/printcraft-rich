@@ -116,7 +116,98 @@ impl Automation {
         Ok(json!({ "path": path.to_string_lossy(), "certificate": cert_json(&id.certificate) }))
     }
 
+    /// The PKCS #11 libraries to ask: `module` (a well-known location, or a file inside the
+    /// allowed directory: loading a library runs its code), else every well-known one present.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn token_modules(&self, a: &Args) -> Result<Vec<std::path::PathBuf>> {
+        let known = sign::pkcs11::default_modules();
+        let Some(m) = a.opt_str("module")? else { return Ok(known) };
+        let p = std::path::Path::new(m);
+        if known.iter().any(|k| k == p) {
+            return Ok(vec![p.to_path_buf()]);
+        }
+        let path = self.resolve(m, false)?;
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        if !path.is_file() || (!matches!(ext.as_str(), "so" | "dylib" | "dll") && !path.to_string_lossy().contains(".so.")) {
+            return Err(bad(format!("module {m:?} must be a PKCS #11 library file (.so, .dylib or .dll)")));
+        }
+        Ok(vec![path])
+    }
+
+    /// sign_token_ids: smart card and token identities (and the Windows certificate store).
+    pub(crate) fn sign_token_ids(&self, a: &Args) -> Result<Value> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let modules = self.token_modules(a)?;
+            #[cfg_attr(not(windows), allow(unused_mut))]
+            let (ids, mut errors) = sign::pkcs11::identities_in(&modules);
+            #[cfg_attr(not(windows), allow(unused_mut))]
+            let mut list: Vec<Value> = ids
+                .iter()
+                .map(|id| {
+                    json!({
+                        "id": id.reference,
+                        "source": "pkcs11",
+                        "name": id.certificate.display_name(),
+                        "usage": sign::pkcs11::usage(&id.certificate),
+                        "description": id.description(),
+                        "label": id.label,
+                        "token": id.token_label,
+                        "token_serial": id.token_serial,
+                        "module": id.module.to_string_lossy(),
+                        "pin_pad": id.pin_pad,
+                        "certificate": cert_json(&id.certificate),
+                    })
+                })
+                .collect();
+            #[cfg(windows)]
+            if a.opt_str("module")?.is_none() {
+                match sign::certstore::identities() {
+                    Ok(ids) => list.extend(ids.iter().map(|id| {
+                        json!({
+                            "id": sign::certstore::reference(&id.certificate),
+                            "source": "certstore",
+                            "name": id.certificate.display_name(),
+                            "usage": sign::pkcs11::usage(&id.certificate),
+                            "certificate": cert_json(&id.certificate),
+                        })
+                    })),
+                    Err(e) => errors.push(format!("Windows certificate store: {e}")),
+                }
+            }
+            let modules: Vec<String> = modules.iter().map(|m| m.to_string_lossy().into_owned()).collect();
+            Ok(json!({ "count": list.len(), "ids": list, "modules": modules, "errors": errors }))
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = a;
+            Ok(json!({ "count": 0, "ids": [], "modules": [], "errors": ["smart cards are not available in the browser"] }))
+        }
+    }
+
     fn open_id(&self, a: &Args) -> Result<DigitalId> {
+        // A smart card or token: "pkcs11:<fingerprint>" or "pkcs11:<common name>".
+        if a.str("id")?.starts_with("pkcs11:") {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let modules = self.token_modules(a)?;
+                let id = sign::pkcs11::find(a.str("id")?, &modules).map_err(failed)?;
+                let pin = a.opt_str("pin")?;
+                if pin.is_none() && !id.pin_pad {
+                    return Err(bad(format!("{} is on a smart card: pass its PIN as `pin`", id.certificate.display_name())));
+                }
+                return Ok(id.digital_id(pin));
+            }
+            #[cfg(target_arch = "wasm32")]
+            return Err(failed("smart cards are not available in the browser"));
+        }
+        // The Windows certificate store: "certstore:<fingerprint>" or "certstore:<common name>".
+        if let Some(r) = a.str("id")?.strip_prefix("certstore:") {
+            #[cfg(windows)]
+            return sign::certstore::find(&format!("certstore:{r}")).map_err(failed);
+            #[cfg(not(windows))]
+            return Err(failed(format!("certstore:{r}: the certificate store is only available on Windows")));
+        }
         // A macOS Keychain identity: "keychain:<fingerprint>" or "keychain:<common name>".
         if let Some(r) = a.str("id")?.strip_prefix("keychain:") {
             #[cfg(target_os = "macos")]

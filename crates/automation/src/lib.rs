@@ -541,6 +541,7 @@ impl Automation {
                 let ids: Vec<Value> = Vec::new();
                 json!({ "count": ids.len(), "ids": ids })
             }
+            "sign_token_ids" => self.sign_token_ids(&a)?,
             "sign_trust" => self.sign_trust(&a)?,
             "comment_mark" => self.comment_mark(&a)?,
             "comment_lock" => self.comment_lock(&a)?,

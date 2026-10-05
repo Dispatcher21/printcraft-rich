@@ -27,13 +27,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Linux system dependencies (egui/winit/rfd)
+      - name: Install Linux system dependencies (egui/winit/rfd; SoftHSM2 for the smart card tests)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev \
-            libgl1-mesa-dev libgtk-3-dev
+            libgl1-mesa-dev libgtk-3-dev softhsm2
 
       - uses: dtolnay/rust-toolchain@stable
         with:

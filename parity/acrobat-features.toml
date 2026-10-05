@@ -5771,11 +5771,11 @@ title = "Sign with the Windows certificate store"
 area = "H"
 tier = "P0"
 milestone = "M9"
-status = "planned"
-commands = []
-tools = []
+status = "partial"
+commands = ["sign.digital"]
+tools = ["sign_token_ids", "sign_document"]
 evidence = []
-notes = ""
+notes = "printcraft-sign certstore (rustls-cng): certificates in CurrentUser\\MY with a CNG private key (smart cards through the Windows smart card driver included; encryption-only certificates left out), signing with CNG (Windows shows its own PIN prompt; SHA-256/384 PKCS #1 v1.5, ECDSA re-encoded as DER). Listed as certstore:<fingerprint> by sign_token_ids, accepted by sign_document and shown in Sign with a Digital ID on Windows. Missing: it is only compile-checked (cargo clippy --target x86_64-pc-windows-gnu); it has not been run on Windows and has no test there yet"
 
 [[feature]]
 id = "sign.pkcs11"
@@ -5783,11 +5783,11 @@ title = "Sign with PKCS#11 tokens and smart cards"
 area = "H"
 tier = "P1"
 milestone = "M9"
-status = "planned"
-commands = []
-tools = []
-evidence = []
-notes = ""
+status = "shipped"
+commands = ["sign.digital"]
+tools = ["sign_token_ids", "sign_document"]
+evidence = ["crates/sign/tests/pkcs11.rs::signing_with_a_pkcs11_token", "crates/automation/tests/automation.rs::signing_with_a_smart_card_through_tools", "crates/ui-egui/tests/signing.rs::signing_with_a_smart_card", "crates/sign/src/pkcs11.rs::encryption_only_certificates_are_left_out"]
+notes = "Smart cards (US DoD CAC and PIV through OpenSC or ActivClient) and USB tokens via the vendor's PKCS #11 library, loaded at run time (cryptoki; native targets only). Certificates are listed without a PIN (encryption-only ones left out, the rest labelled Digital Signature or Authentication); the card signs after a PIN login (or the reader's PIN pad), CKM_RSA_PKCS over a DigestInfo or CKM_ECDSA re-encoded as DER. pkcs11:<fingerprint|name> for agents, a PIN field and Preferences > Signing library path in the app. Tests run against a SoftHSM2 token and print a note and pass when SoftHSM2 is not installed; not yet tried with a physical CAC"
 
 [[feature]]
 id = "sign.self-signed-id"

@@ -24,3 +24,8 @@ mcp = ["dep:base64"]
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
+printcraft-sign = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# Writes a SoftHSM2 token for the smart card test (tests/automation.rs).
+cryptoki = "0.12"

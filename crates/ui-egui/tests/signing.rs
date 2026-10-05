@@ -6,6 +6,10 @@ use egui_kittest::kittest::Queryable;
 use printcraft_engine::SignatureStatus;
 use printcraft_ui_egui::{Dialog, PrintCraftApp, QuickTool, RightPanel, SignStep};
 
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "../../sign/tests/softhsm/mod.rs"]
+mod softhsm;
+
 const FIXTURE: &[u8] = b"%PDF-1.7
 1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
 2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
@@ -243,4 +247,77 @@ fn clicking_an_empty_signature_field_signs_it() {
     let s = h.state();
     let sig = s.session.get(s.views[1].id).unwrap().signatures.iter().find(|x| x.field == "Approver").cloned().unwrap();
     assert!(sig.signed && sig.visible);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn signing_with_a_smart_card() {
+    // A SoftHSM2 token stands in for a CAC (skipped with a note when SoftHSM isn't installed).
+    softhsm::run("signing_with_a_smart_card", |module| {
+        softhsm::make_token(module);
+        let dir = dir();
+        let mut h = harness(dir.clone());
+        h.state_mut().smart_card_ids = true;
+        h.state_mut().pkcs11_module = module.to_string_lossy().into_owned();
+        assert!(h.state_mut().execute("sign.digital"));
+        let (a, b) = (at(&h, 40.0, 90.0), at(&h, 220.0, 40.0));
+        drag(&mut h, a, b);
+        assert_eq!(h.state().dialog, Some(Dialog::Sign));
+        // The scan runs in the background; the list fills in when it ends.
+        for _ in 0..500 {
+            h.run_steps(1);
+            if !h.state().smart_cards.pending() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        h.run_steps(2);
+        assert!(!h.state().smart_cards.pending(), "the smart card scan ended");
+        assert_eq!(h.state().sign_draft.as_ref().map(|d| d.step), Some(SignStep::Choose), "a card was found: choose it");
+        let paths: Vec<String> = h.state().digital_ids.iter().map(|e| e.path.clone()).collect();
+        assert!(paths.len() >= 2 && paths.iter().all(|p| p.starts_with("pkcs11:")), "{paths:?}");
+        // The entry's sub line reads "Smart card · Digital Signature · Certificate for … · PrintCraft CAC".
+        let detail = &h.state().digital_ids[0].detail;
+        assert!(detail.starts_with("Digital Signature · ") && detail.ends_with("PrintCraft CAC"), "{detail}");
+        h.get_by_label("Token Signer RSA").click();
+        h.run_steps(1);
+        h.get_by_label("Continue").click();
+        h.run_steps(2);
+        h.get_by_label("Sign as \"Token Signer RSA\"");
+        // A PIN field instead of the digital ID password.
+        assert!(h.query_by_label("Digital ID password").is_none());
+        h.get_by_label("The key stays on the smart card. The card locks after several wrong PINs.");
+        field(&h, "PIN").click();
+        h.run_steps(1);
+        field(&h, "PIN").type_text("000000");
+        h.run_steps(1);
+        h.get_by_label("Sign").click();
+        h.run_steps(3);
+        h.get_by_label_contains("PIN is incorrect");
+        assert_eq!(h.state().sign_draft.as_ref().map(|d| d.password.as_str()), Some(""), "a wrong PIN is not kept");
+        field(&h, "PIN").click();
+        h.run_steps(1);
+        field(&h, "PIN").type_text(softhsm::PIN);
+        h.run_steps(1);
+        h.get_by_label("Sign").click();
+        h.run_steps(6);
+
+        let s = h.state();
+        assert_eq!(s.dialog, None);
+        assert!(dir.join("contract_signed.pdf").exists());
+        let doc = s.session.get(s.views[0].id).unwrap();
+        let sig = doc.signatures.iter().find(|x| x.signed).expect("signed");
+        assert_eq!((sig.signer.as_deref(), sig.status), (Some("Token Signer RSA"), SignatureStatus::Unknown));
+        // Smart card entries are listed from the card each time, never saved; the library is.
+        let saved = s.persist();
+        let mut fresh = PrintCraftApp::new();
+        fresh.restore(&saved);
+        assert!(fresh.digital_ids.is_empty());
+        assert_eq!(fresh.pkcs11_module, module.to_string_lossy());
+        // Preferences ▸ Signing shows (and edits) the library.
+        h.state_mut().dialog = Some(Dialog::Preferences);
+        h.run_steps(2);
+        h.get_by_label("Signing");
+        assert_eq!(field(&h, "Smart card library (PKCS #11)").value().as_deref(), Some(module.to_str().unwrap()));
+    });
 }

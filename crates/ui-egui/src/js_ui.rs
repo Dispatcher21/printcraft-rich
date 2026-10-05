@@ -241,5 +241,7 @@ pub(crate) fn preferences_body(ui: &mut egui::Ui, app: &mut PrintCraftApp, t: &T
         );
     });
     ui.add_space(10.0);
+    crate::sign_ui::preferences_section(ui, app, t);
+    ui.add_space(10.0);
     buttons(ui, "OK", &[]).is_some()
 }

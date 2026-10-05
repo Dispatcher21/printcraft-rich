@@ -547,13 +547,19 @@ pub fn tools() -> Vec<ToolDef> {
             .ro()
             .cmd("sign.digital")
             .with(schema(json!({}), &[])),
-        t("sign_document", "Sign a document", "Sign with a digital ID (a .p12/.pfx path, or on macOS a Keychain identity: \"keychain:<common name or fingerprint>\" from sign_keychain_ids) and save the signed file to `out` (signing always saves, as in Acrobat; the document then shows the signed file). Sign an existing empty signature field (`field`), or a new one on `page` at `rect` (omit rect for an invisible signature). certify: no_changes, form_fill or comments makes a certification signature. PAdES B-B, SHA-256 (SHA-384 for P-384 keys).")
+        t("sign_token_ids", "List smart card digital IDs", "The signing identities on PKCS #11 tokens and smart cards (a CAC or PIV card through OpenSC or ActivClient, USB tokens), read without a PIN: certificate details, usage (\"Digital Signature\", \"Authentication\"; encryption-only certificates are left out), token, and the pkcs11: reference sign_document takes. `module` is the PKCS #11 library to ask (default: the well-known OpenSC, ActivClient and p11-kit locations that exist). On Windows, also the certificates with a private key in the user's certificate store (certstore: references), smart cards included. `errors` lists libraries that couldn't be read.")
+            .ro()
+            .cmd("sign.digital")
+            .with(schema(json!({ "module": { "type": "string", "description": "Path of a PKCS #11 library (.so, .dylib, .dll)." } }), &[])),
+        t("sign_document", "Sign a document", "Sign with a digital ID (a .p12/.pfx path; a smart card or token identity \"pkcs11:<fingerprint or common name>\" from sign_token_ids, with its `pin` and optionally the `module` that sees it; on Windows a certificate store identity \"certstore:<fingerprint or common name>\", for which Windows asks the PIN itself; or on macOS a Keychain identity: \"keychain:<common name or fingerprint>\" from sign_keychain_ids) and save the signed file to `out` (signing always saves, as in Acrobat; the document then shows the signed file). Sign an existing empty signature field (`field`), or a new one on `page` at `rect` (omit rect for an invisible signature). certify: no_changes, form_fill or comments makes a certification signature. PAdES B-B, SHA-256 (SHA-384 for P-384 keys).")
             .cmd("sign.digital")
             .with(schema(
                 json!({
                     "doc": doc(),
-                    "id": { "type": "string", "description": "Path of the digital ID (.p12 / .pfx)." },
+                    "id": { "type": "string", "description": "Path of the digital ID (.p12 / .pfx), or a pkcs11:, certstore: or keychain: reference." },
                     "password": { "type": "string" },
+                    "pin": { "type": "string", "description": "The smart card or token PIN (pkcs11: ids; omit for a reader with a PIN pad). A wrong PIN counts toward locking the card." },
+                    "module": { "type": "string", "description": "pkcs11: ids: the PKCS #11 library (default: the well-known locations)." },
                     "field": { "type": "string" },
                     "page": { "type": "integer", "minimum": 1 },
                     "rect": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 },

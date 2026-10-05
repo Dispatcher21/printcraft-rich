@@ -7,6 +7,10 @@ use printcraft_automation::mcp::McpServer;
 use printcraft_automation::{Automation, Content, ToolError, tools};
 use serde_json::{Value, json};
 
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "../../sign/tests/softhsm/mod.rs"]
+mod softhsm;
+
 /// A PDF with `n` 200×300 pt pages reading "Page 1", "Page 2", …
 fn fixture(n: usize) -> Vec<u8> {
     let mut objs: Vec<Vec<u8>> = vec![b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()];
@@ -1175,6 +1179,74 @@ fn drawing_comments_through_tools() {
     assert!(info.to_string().contains("notes.txt"), "{info}");
     let png = a.call("page_render", &json!({ "doc": doc, "page": 1, "dpi": 72 })).unwrap();
     assert!(matches!(png[0], Content::Png { .. }));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn signing_with_a_smart_card_through_tools() {
+    // A SoftHSM2 token stands in for a CAC (skipped with a note when SoftHSM isn't installed).
+    softhsm::run("signing_with_a_smart_card_through_tools", |module| {
+        let made = softhsm::make_token(module);
+        let dir = workdir("smart-card");
+        let m = module.to_str().unwrap();
+        // With an allowed directory, a library outside it is refused: loading one runs its code.
+        let mut rooted = auto(&dir);
+        assert!(rooted.call("sign_token_ids", &json!({ "module": m })).is_err());
+        assert!(matches!(rooted.call("sign_token_ids", &json!({ "module": "a.pdf" })), Err(ToolError::InvalidArgs(_))));
+
+        // October 2026: inside the token certificates' validity (2026 to 2031).
+        let mut a = Automation::new().with_clock(|| 1_790_000_000);
+        let ids = ok(&mut a, "sign_token_ids", json!({ "module": m }));
+        assert_eq!(ids["count"], 2, "{ids}");
+        assert_eq!(ids["errors"], json!([]));
+        let first = &ids["ids"][0];
+        assert_eq!(first["id"], printcraft_sign::pkcs11::reference(&made[0].certificate));
+        assert_eq!(
+            (first["source"].as_str(), first["usage"].as_str(), first["token"].as_str()),
+            (Some("pkcs11"), Some("Digital Signature"), Some("PrintCraft CAC"))
+        );
+        assert_eq!((first["name"].as_str(), first["pin_pad"].as_bool()), (Some("Token Signer RSA"), Some(false)));
+        assert_eq!(first["label"], "Certificate for Digital Signature");
+        let rsa = first["id"].as_str().unwrap().to_string();
+
+        let doc = ok(&mut a, "doc_open", json!({ "path": dir.join("a.pdf") }))["doc"].as_u64().unwrap();
+        let out = dir.join("cac-signed.pdf");
+        let sign = |pin: Option<&str>, id: &str, out: &Path| {
+            let mut args = json!({ "doc": doc, "id": id, "module": m, "page": 1, "rect": [20, 200, 180, 250], "out": out });
+            if let Some(p) = pin {
+                args["pin"] = json!(p);
+            }
+            args
+        };
+        // No PIN, a wrong PIN: errors that say what to do; nothing is written.
+        assert!(matches!(a.call("sign_document", &sign(None, &rsa, &out)), Err(ToolError::InvalidArgs(e)) if e.contains("PIN")));
+        match a.call("sign_document", &sign(Some("000000"), &rsa, &out)) {
+            Err(ToolError::Failed(e)) => assert!(e.contains("PIN is incorrect") && e.contains("locks"), "{e}"),
+            other => panic!("expected a wrong-PIN error, got {other:?}"),
+        }
+        assert!(!out.exists());
+        assert!(matches!(a.call("sign_document", &sign(Some(softhsm::PIN), "pkcs11:Nobody", &out)), Err(ToolError::Failed(_))));
+
+        let r = ok(&mut a, "sign_document", sign(Some(softhsm::PIN), &rsa, &out));
+        assert_eq!((r["signature"]["signer"].as_str(), r["signature"]["status"].as_str()), (Some("Token Signer RSA"), Some("unknown")));
+        assert!(out.exists());
+        // The EC identity by its common name, as a second (invisible) signature.
+        let out2 = dir.join("cac-signed-twice.pdf");
+        let mut args = json!({ "doc": doc, "id": "pkcs11:Token Signer EC", "module": m, "pin": softhsm::PIN, "out": out2 });
+        args["reason"] = json!("Countersigned");
+        let r = ok(&mut a, "sign_document", args);
+        assert_eq!(r["signature"]["signer"], "Token Signer EC");
+        // Trusting both certificates makes both signatures valid.
+        let mut paths = Vec::new();
+        for (i, id) in made.iter().enumerate() {
+            let p = dir.join(format!("token-{i}.pem"));
+            std::fs::write(&p, printcraft_sign::x509::to_pem(&id.certificate)).unwrap();
+            paths.push(p);
+        }
+        ok(&mut a, "sign_trust", json!({ "paths": paths }));
+        let list = ok(&mut a, "sign_list", json!({ "doc": doc }));
+        assert_eq!((list["signed"].as_u64(), list["all_valid"].as_bool()), (Some(2), Some(true)), "{list}");
+    });
 }
 
 #[test]
