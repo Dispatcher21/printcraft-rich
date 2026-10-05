@@ -99,6 +99,14 @@ pub(crate) fn xfa_pdf(template: &str, datasets: &str) -> Vec<u8> {
     pdf(&objs)
 }
 
+pub(crate) fn open_doc(bytes: Vec<u8>) -> Document {
+    open(bytes)
+}
+
+pub(crate) fn reopen_doc(doc: &Document) -> Document {
+    reopen(doc)
+}
+
 fn open(bytes: Vec<u8>) -> Document {
     Document::open(Arc::new(bytes)).unwrap_or_else(|_| Document::new_empty())
 }

@@ -5,7 +5,7 @@ use printcraft_engine::form_scripts::{CalcOp, Calculate, Format, Validate};
 use printcraft_engine::{Edit, FieldProps, FieldValue, FormField, FormFieldKind, NewField, field_flags};
 use serde_json::{Value, json};
 
-use crate::{Args, Automation, Result, ToolError, failed};
+use crate::{Args, Automation, Result, ToolError, failed, summary};
 
 fn bad(m: impl Into<String>) -> ToolError {
     ToolError::InvalidArgs(m.into())
@@ -269,6 +269,22 @@ impl Automation {
     pub(crate) fn form_reset(&mut self, a: &Args) -> Result<Value> {
         let names = a.get("fields").map(|_| a.strs("fields").map(|v| v.into_iter().map(str::to_owned).collect::<Vec<_>>())).transpose()?;
         self.apply(a, Edit::ResetForm { names })
+    }
+
+    pub(crate) fn form_press_button(&mut self, a: &Args) -> Result<Value> {
+        let name = a.str("field")?.to_owned();
+        let id = self.doc(a)?.id;
+        if !self.doc(a)?.form.iter().any(|f| f.name == name) {
+            return Err(failed(format!("no field named {name:?} (form_fields lists them)")));
+        }
+        self.session.apply(id, Edit::PressXfaButton { name }).map_err(failed)?;
+        let out = self.session.take_js_output(id);
+        let mut v = summary(self.doc(a)?);
+        if let Some(o) = v.as_object_mut() {
+            o.insert("messages".into(), json!(out.alerts));
+            o.insert("script_errors".into(), json!(out.errors));
+        }
+        Ok(v)
     }
 
     pub(crate) fn form_add_field(&mut self, a: &Args) -> Result<Value> {

@@ -157,7 +157,11 @@ fn scope_of(edit: &Edit) -> Scope {
         | Edit::ResizeAnnotation { .. }
         | Edit::StyleAnnotation { .. }
         | Edit::SetAnnotationInfo { .. } => Scope::Comments,
-        Edit::SetFieldValue { .. } | Edit::ResetForm { .. } | Edit::SetFieldImage { .. } | Edit::ApplyScriptChanges { .. } => Scope::Form,
+        Edit::SetFieldValue { .. }
+        | Edit::ResetForm { .. }
+        | Edit::SetFieldImage { .. }
+        | Edit::ApplyScriptChanges { .. }
+        | Edit::PressXfaButton { .. } => Scope::Form,
         Edit::Batch { edits, .. } => {
             let mut scopes = edits.iter().map(scope_of);
             let first = scopes.next().unwrap_or(Scope::Full);
@@ -226,28 +230,110 @@ pub struct XfaState {
     pub report: Option<printcraft_xfa::Report>,
     /// Why a dynamic form could not be laid out (its placeholder pages are shown instead).
     pub error: Option<String>,
+    /// What the form's scripts said while it opened.
+    pub output: printcraft_xfa::Output,
 }
 
 /// A laid-out XFA form: the new working bytes (an appended revision) and their parse.
 type Realized = (Arc<Vec<u8>>, printcraft_cos::Document);
 
-/// Lay out a dynamic XFA form as real pages and fields (`None` when the document has no XFA).
-fn realize_xfa(cos: &printcraft_cos::Document, password: Option<&str>) -> Option<(XfaState, Option<Realized>)> {
+/// Lay out a dynamic XFA form as real pages and fields, running its scripts; a static form's
+/// opening scripts run too (`None` when the document has no XFA).
+fn realize_xfa(cos: &printcraft_cos::Document, password: Option<&str>, opts: &printcraft_xfa::Options) -> Option<(XfaState, Option<Realized>)> {
     let kind = printcraft_xfa::kind(cos)?;
+    let reopen = |doc: &printcraft_cos::Document| -> Result<Realized, String> {
+        let bytes = Arc::new(write_incremental(doc, &SaveOptions::default()).map_err(|e| e.to_string())?);
+        let reopened = printcraft_cos::Document::open_with_password(bytes.clone(), password).map_err(|e| e.to_string())?;
+        Ok((bytes, reopened))
+    };
     if kind == printcraft_xfa::Kind::Static {
-        return Some((XfaState { dynamic: false, report: None, error: None }, None));
+        let state = XfaState { dynamic: false, report: None, error: None, output: Default::default() };
+        if !opts.scripts {
+            return Some((state, None));
+        }
+        // Calculations and initial values the scripts set show up as an opening revision.
+        let attempt = guard(|| -> Result<_, String> {
+            let mut doc = cos.clone();
+            let outcome = printcraft_xfa::open_static(&mut doc, opts).map_err(|e| e.to_string())?;
+            let realized = if doc.is_modified() { Some(reopen(&doc)?) } else { None };
+            Ok((outcome, realized))
+        });
+        return Some(match attempt {
+            Ok(Ok((outcome, realized))) => (XfaState { output: outcome.output, ..state }, realized),
+            Ok(Err(_)) | Err(_) => (state, None),
+        });
     }
     let attempt = guard(|| -> Result<_, String> {
         let mut doc = cos.clone();
-        let report = printcraft_xfa::realize(&mut doc).map_err(|e| e.to_string())?;
-        let bytes = Arc::new(write_incremental(&doc, &SaveOptions::default()).map_err(|e| e.to_string())?);
-        let reopened = printcraft_cos::Document::open_with_password(bytes.clone(), password).map_err(|e| e.to_string())?;
-        Ok((report, bytes, reopened))
+        let report = printcraft_xfa::realize_with(&mut doc, opts).map_err(|e| e.to_string())?;
+        Ok((report, reopen(&doc)?))
     });
     Some(match attempt {
-        Ok(Ok((report, bytes, reopened))) => (XfaState { dynamic: true, report: Some(report), error: None }, Some((bytes, reopened))),
-        Ok(Err(e)) | Err(e) => (XfaState { dynamic: true, report: None, error: Some(e) }, None),
+        Ok(Ok((mut report, realized))) => {
+            let output = std::mem::take(&mut report.output);
+            (XfaState { dynamic: true, report: Some(report), error: None, output }, Some(realized))
+        }
+        Ok(Err(e)) | Err(e) => (XfaState { dynamic: true, report: None, error: Some(e), output: Default::default() }, None),
     })
+}
+
+/// After an edit of an XFA form: the filled fields' events and the calculations, or a button's
+/// click scripts. Returns what the scripts did (`None`: nothing to run).
+fn xfa_after(doc: &mut printcraft_cos::Document, edit: &Edit, opts: &printcraft_xfa::Options) -> Result<Option<printcraft_xfa::Outcome>, EditError> {
+    if let Edit::PressXfaButton { name } = edit {
+        if !opts.scripts {
+            return Err(EditError::Invalid("JavaScript is turned off (Preferences ▸ JavaScript), so the form's buttons don't run".into()));
+        }
+        if !printcraft_xfa::has_click(doc, name) {
+            return Err(EditError::Invalid(format!("{} has no action", xfa_short_name(name))));
+        }
+        let mut trial = doc.clone();
+        let o = guard(|| printcraft_xfa::click(&mut trial, name, opts))
+            .map_err(|m| EditError::Invalid(format!("pressing {} failed unexpectedly ({m})", xfa_short_name(name))))?
+            .map_err(|e| EditError::Invalid(e.to_string()))?;
+        *doc = trial;
+        return Ok(Some(o));
+    }
+    let mut names = Vec::new();
+    if !value_names(edit, &mut names) {
+        return Ok(None);
+    }
+    // On a failure the fill stands as it is (the data is synced again on save).
+    let mut trial = doc.clone();
+    match guard(|| printcraft_xfa::after_edit(&mut trial, &names, opts)) {
+        Ok(Ok(o)) => {
+            *doc = trial;
+            Ok(Some(o))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The fields an edit fills; false when it doesn't change field values.
+fn value_names(edit: &Edit, out: &mut Vec<String>) -> bool {
+    match edit {
+        Edit::SetFieldValue { name, .. } => {
+            out.push(name.clone());
+            true
+        }
+        Edit::ResetForm { .. } | Edit::ApplyScriptChanges { .. } => true,
+        Edit::Batch { edits, .. } => edits.iter().fold(false, |any, e| value_names(e, out) || any),
+        _ => false,
+    }
+}
+
+/// `form1[0].Items[0].AddRow[0]` → `AddRow`.
+fn xfa_short_name(som: &str) -> String {
+    let last = som.rsplit('.').next().unwrap_or(som);
+    last.split('[').next().unwrap_or(last).to_string()
+}
+
+/// What XFA scripts said, as script output the shell shows.
+fn xfa_js_output(o: printcraft_xfa::Output) -> js::JsOutput {
+    let mut requests: Vec<js::Request> = (0..o.prints.min(1)).map(|_| js::Request::Print).collect();
+    requests.extend(o.urls.into_iter().map(js::Request::LaunchUrl));
+    requests.extend(o.focus.map(js::Request::Focus));
+    js::JsOutput { alerts: o.messages, console: o.console, requests, errors: o.errors }
 }
 
 /// Copy form values into the XFA data before saving (a no-op without XFA).
@@ -871,6 +957,11 @@ pub enum Edit {
     ApplyScriptChanges {
         changes: Vec<printcraft_forms::FieldChange>,
     },
+    /// Press a button of an XFA form: its `click` scripts run (add or remove a row, show a
+    /// section, …), then the calculations.
+    PressXfaButton {
+        name: String,
+    },
     /// Scan & OCR ▸ Recognize text: put recognised words on `page` as invisible text over the
     /// image (from [`ocr::OcrJob::run`]).
     AddOcrText {
@@ -1067,6 +1158,7 @@ impl Edit {
             Edit::MarkDecorative { .. } => "Mark figure as decorative".into(),
             Edit::AddOcrText { .. } => "Recognize text".into(),
             Edit::ApplyScriptChanges { .. } => "Run JavaScript".into(),
+            Edit::PressXfaButton { name } => format!("Press {}", xfa_short_name(name)),
             Edit::ConvertPdfA { level } => format!("Save as {}", level.label()),
             Edit::SetFieldScript { name, .. } => format!("Edit script of {name}"),
             Edit::SetDocumentScript { script: None, .. } => "Delete document JavaScript".into(),
@@ -1195,7 +1287,7 @@ fn check_permission(edit: &Edit, p: &printcraft_cos::Permissions) -> Result<(), 
                 Err(EditError::NotPermitted("comments"))
             }
         }
-        Edit::SetFieldValue { .. } | Edit::ResetForm { .. } | Edit::SetFieldImage { .. } | Edit::ApplyScriptChanges { .. } => {
+        Edit::SetFieldValue { .. } | Edit::ResetForm { .. } | Edit::SetFieldImage { .. } | Edit::ApplyScriptChanges { .. } | Edit::PressXfaButton { .. } => {
             if p.fill_forms() {
                 Ok(())
             } else {
@@ -1400,6 +1492,8 @@ fn run_edit(doc: &mut printcraft_cos::Document, edit: &Edit, cx: &mut EditCtx) -
             Some(js) => printcraft_forms::set_value_with(doc, name, value, js)?,
             None => printcraft_forms::set_value(doc, name, value)?,
         },
+        // Handled after the edit runs (see `xfa_after`).
+        Edit::PressXfaButton { .. } => {}
         Edit::ApplyScriptChanges { changes } => match cx.js.as_mut() {
             Some(js) => printcraft_forms::apply_script_changes(doc, changes, js)?,
             None => printcraft_forms::apply_script_changes(doc, changes, &mut printcraft_forms::NoScripts)?,
@@ -1812,8 +1906,9 @@ impl Session {
         // A dynamic XFA form has only placeholder pages: lay it out first, and work on that.
         let mut bytes = bytes;
         let mut xfa = None;
+        let xfa_opts = self.xfa_options();
         if let Ok(Ok(d)) = &cos
-            && let Some((state, realized)) = realize_xfa(d, password)
+            && let Some((state, realized)) = realize_xfa(d, password, &xfa_opts)
         {
             if let Some((b, d)) = realized {
                 bytes = b;
@@ -1874,7 +1969,7 @@ impl Session {
             sig_cache,
             editor,
             config,
-            js_output: Default::default(),
+            js_output: xfa.as_ref().map(|x| xfa_js_output(x.output.clone())).unwrap_or_default(),
             xfa,
         });
         Ok(id)
@@ -1895,6 +1990,7 @@ impl Session {
         cx.today = today;
         let reason = doc.read_only_reason.clone().unwrap_or_default();
         let signed = doc.is_signed();
+        let xfa_on = doc.xfa.is_some();
         let editor = doc.editor.as_mut().ok_or(EditError::ReadOnly(reason))?;
         if let Some(p) = editor.cos.permissions() {
             check_permission(&edit, &p)?;
@@ -1906,6 +2002,14 @@ impl Session {
         // `next` is a copy: if the edit fails or crashes, the document is unchanged.
         guard(|| run_edit(&mut next, &edit, &mut cx))
             .unwrap_or_else(|m| Err(EditError::Invalid(format!("{} failed unexpectedly ({m}); the document was not changed", edit.label()))))?;
+        // XFA forms: the fields' events and calculations, or a button's scripts.
+        let xfa = match (xfa_on, &edit) {
+            (true, _) => {
+                xfa_after(&mut next, &edit, &printcraft_xfa::Options { scripts: !js_off, today: (today.0.clamp(1, 9999) as i32, today.1, today.2) })?
+            }
+            (false, Edit::PressXfaButton { .. }) => return Err(EditError::Invalid("the document has no XFA form".into())),
+            _ => None,
+        };
         // Signed documents are only ever saved incrementally: an edit that needs a full rewrite
         // (applying redactions, changing security, sanitizing) would invalidate the signatures.
         let rewrites = |c: &printcraft_cos::Document| c.full_save_required() || c.encryption_changed();
@@ -1915,7 +2019,8 @@ impl Session {
         let previous = std::mem::replace(&mut editor.cos, next);
         let keys = keys_after(&edit).unwrap_or_else(|| editor.keys.clone());
         let previous_keys = std::mem::replace(&mut editor.keys, keys);
-        let scope = scope_of(&edit);
+        // Scripts that laid the pages out again changed more than field values.
+        let scope = if xfa.as_ref().is_some_and(|o| o.relaid) { Scope::Full } else { scope_of(&edit) };
         editor.undo.push((edit.label(), previous, previous_keys, scope));
         if editor.undo.len() > MAX_UNDO {
             editor.undo.remove(0);
@@ -1940,7 +2045,16 @@ impl Session {
         if let Some(js) = cx.js {
             doc.js_output.append(js.output);
         }
+        if let Some(o) = xfa {
+            doc.js_output.append(xfa_js_output(o.output));
+        }
         Ok(())
+    }
+
+    /// How XFA scripts run in this session (Preferences ▸ JavaScript, today's date).
+    fn xfa_options(&self) -> printcraft_xfa::Options {
+        let (y, m, d) = self.today();
+        printcraft_xfa::Options { scripts: !self.js_off, today: (y.clamp(1, 9999) as i32, m, d) }
     }
 
     pub fn undo(&mut self, id: DocId) -> Result<String, EditError> {

@@ -230,6 +230,12 @@ pub fn tools() -> Vec<ToolDef> {
             "Set several fields at once (one undo step). values maps field names (from form_fields) to: a string for text fields, combo boxes and radio groups (an option), true/false for check boxes, an array of strings for multi-select lists. Appearances are regenerated so every viewer shows the values.",
         )
         .with(schema(json!({ "doc": doc(), "values": { "type": "object", "description": "Field name → value." } }), &["doc", "values"])),
+        t(
+            "form_press_button",
+            "Press a form button",
+            "Press a button of an XFA form (field name from form_fields): its click scripts run (add or remove a table row, show or hide a section, …), then the form's calculations; the pages are laid out again when the form's structure changed. Returns the document summary and what the scripts said (messages, errors). Filling fields with form_fill runs the XFA form's change and exit scripts and calculations the same way. Undoable.",
+        )
+        .with(schema(json!({ "doc": doc(), "field": { "type": "string" } }), &["doc", "field"])),
         t("form_reset", "Clear form", "Reset fields to their default values: all of them, or only those listed. Undoable.")
             .destructive()
             .with(schema(json!({ "doc": doc(), "fields": { "type": "array", "items": { "type": "string" } } }), &["doc"])),

@@ -49,14 +49,21 @@ command line.
    When anything changes, `/Perms /UR3` (Reader usage rights) is removed because the change
    invalidates it.
 
+## Scripts
+
+`realize_with`, `after_edit` and `click` run the form's scripts (JavaScript on the sandboxed
+boa engine of `printcraft-js`, FormCalc on this crate's interpreter) against a live form model
+(`dom`, `host`): `initialize`, calculations and `ready` events on open; `change`, `click`,
+`exit`, validations and calculations while filling; button `click` scripts. Changes to
+visibility, properties and instances lay the pages out again. Property changes are saved in
+the catalog's `/PieceInfo /PrintCraft` so they survive reopening; row counts live in the data.
+
 ## Not supported
 
-- Scripts (JavaScript and FormCalc): calculations, show/hide logic, initialization. A report
-  note counts them.
-- Adding or removing repeating rows while filling (instances come from the data and `<occur>`).
 - Splitting a text block across pages; `keep`, leaders and trailers; overflow targets.
 - Linked (non-embedded) images and fonts; barcodes and image fields are drawn as frames.
 - Number pictures (`num{…}`); dates use the canonical form when their picture isn't understood.
+- FormCalc financial and URL functions; `messageBox` can't ask the user (answers OK / Yes).
 
-Everything is untrusted input: depth, node, instance and page counts are capped, and nothing
-panics (see the hostile-input tests).
+Everything is untrusted input: depth, node, instance and page counts are capped, scripts run
+with loop, step and recursion limits, and nothing panics (see the hostile-input tests).

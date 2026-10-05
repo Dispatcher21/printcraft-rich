@@ -98,6 +98,8 @@ pub const SIDEWAYS: &[(&str, &str)] = &[
     ("redact", "edit"),
     // XFA forms are mirrored as AcroForm fields, built and read with the forms crate.
     ("xfa", "forms"),
+    // XFA JavaScript runs in the same sandboxed engine as Acrobat JavaScript.
+    ("xfa", "js"),
     ("a11y", "preflight"),
     ("prepress", "preflight"),
     ("export", "ocr"),

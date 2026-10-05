@@ -4076,11 +4076,13 @@ dependencies = [
 name = "printcraft-xfa"
 version = "0.1.1"
 dependencies = [
+ "boa_engine",
  "hayro-syntax",
  "png 0.18.1",
  "printcraft-cos",
  "printcraft-fonts",
  "printcraft-forms",
+ "printcraft-js",
  "thiserror 2.0.21",
 ]
 

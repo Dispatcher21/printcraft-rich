@@ -97,6 +97,11 @@ pub(crate) fn page_input(
         _ if f.read_only() => view.forms.notice = Some(format!("{} is read-only", f.name)),
         FormFieldKind::PushButton => match &f.button {
             Some(a) => view.forms.button = Some((f.name.clone(), a.clone())),
+            // XFA buttons (named by SOM, `form1[0].…[0]`) act through the form's scripts.
+            None if f.name.ends_with(']') => {
+                view.forms.focus = None;
+                view.pending_edit = Some(Edit::PressXfaButton { name: f.name.clone() });
+            }
             None => view.forms.notice = Some(format!("{} has no action", f.name)),
         },
         FormFieldKind::Signature => view.sign.field = Some(f.name.clone()),

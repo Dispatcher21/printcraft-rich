@@ -998,12 +998,12 @@ const MAX_PREFIX_RUN: usize = 64;
 const MAX_CONDITIONALS: usize = 4096;
 /// The script thread's stack.
 #[cfg(not(target_arch = "wasm32"))]
-const SCRIPT_STACK: usize = 1 << 30;
+pub const SCRIPT_STACK: usize = 1 << 30;
 
 /// Why `source` is refused, if it is: too long, or nested deeper than any form needs. Strings
 /// and comments are skipped; brackets in regular expressions and templates count, which only
 /// errs on the safe side.
-fn refuse(source: &str) -> Option<String> {
+pub fn refuse(source: &str) -> Option<String> {
     if source.len() > MAX_SCRIPT_BYTES {
         return Some(format!("the script is too long ({} KiB; the limit is {} KiB)", source.len() / 1024, MAX_SCRIPT_BYTES / 1024));
     }

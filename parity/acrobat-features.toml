@@ -5083,7 +5083,7 @@ status = "partial"
 commands = []
 tools = []
 evidence = ["crates/xfa/src/tests.rs::static_forms_save_values_into_the_xfa_data"]
-notes = "filling uses the AcroForm mirror; values are written back into the XFA datasets on save. No XFA scripts"
+notes = "filling uses the AcroForm mirror; values are written back into the XFA datasets on save. Scripts run (calculations, show/hide as hidden widgets); static forms can't add rows"
 
 [[feature]]
 id = "form.xfa-dynamic"
@@ -5095,7 +5095,7 @@ status = "partial"
 commands = []
 tools = []
 evidence = ["crates/xfa/src/tests.rs::dynamic_form_becomes_pages_and_fields", "crates/engine/src/tests.rs::dynamic_xfa_forms_open_as_fillable_pages_and_save_into_the_xfa_data"]
-notes = "laid out on open (positioned, tb, lr-tb, row/table, page breaks, repeating subforms, master pages, prototypes, date pictures). Missing: scripts, adding rows interactively, text split across pages, linked images, barcodes"
+notes = "laid out on open (positioned, tb, lr-tb, row/table, page breaks, repeating subforms, master pages, prototypes, date pictures); scripts run and re-lay the form out when they show, hide, add or remove parts. Missing: text split across pages, linked images, barcodes"
 
 [[feature]]
 id = "form.xfa-formcalc"
@@ -5103,11 +5103,23 @@ title = "FormCalc scripting"
 area = "F"
 tier = "P1"
 milestone = "M12"
-status = "planned"
+status = "shipped"
 commands = []
-tools = []
-evidence = []
-notes = ""
+tools = ["form_fill", "form_press_button"]
+evidence = ["crates/xfa/src/script_tests.rs::formcalc_built_ins", "crates/xfa/src/script_tests.rs::buttons_add_and_remove_rows", "crates/automation/tests/automation.rs::xfa_scripts_through_tools"]
+notes = "lexer, parser and evaluator: accessors, control flow, user functions, arithmetic, date, logical and string built-ins. Not supported: financial and URL functions"
+
+[[feature]]
+id = "form.xfa-javascript"
+title = "XFA JavaScript: calculations, show/hide, adding and removing rows"
+area = "F"
+tier = "P1"
+milestone = "M12"
+status = "shipped"
+commands = []
+tools = ["form_fill", "form_press_button"]
+evidence = ["crates/xfa/src/script_tests.rs::opening_runs_initialize_and_calculations", "crates/xfa/src/script_tests.rs::a_check_box_shows_a_section_and_it_stays_shown", "crates/xfa/src/script_tests.rs::change_events_messages_and_validation", "crates/xfa/src/script_tests.rs::hostile_scripts_are_stopped", "crates/engine/src/tests.rs::xfa_scripts_run_when_filling_and_pressing_buttons", "crates/automation/tests/automation.rs::xfa_scripts_through_tools"]
+notes = "initialize, calculate, validate, change, click, exit, form/layout ready and docReady events; rawValue, presence, access, colours, captions, list items, instanceManager (add, insert, remove, move, setInstances), resolveNode(s), script objects, xfa.host, xfa.layout page numbers. Script changes persist across edits and reopening. messageBox can't ask questions (answers OK/Yes)"
 
 [[feature]]
 id = "form.xfa-data"

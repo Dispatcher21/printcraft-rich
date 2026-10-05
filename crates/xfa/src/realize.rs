@@ -19,8 +19,10 @@ use crate::{XfaError, picture};
 pub struct Report {
     pub pages: usize,
     pub fields: usize,
-    /// Things the form uses that were not reproduced (scripts, unsupported widgets).
+    /// Things the form uses that were not reproduced (unsupported widgets, script errors).
     pub notes: Vec<String>,
+    /// What the form's scripts said while opening (messages, errors).
+    pub output: crate::host::Output,
 }
 
 fn n(v: f64) -> String {
@@ -287,9 +289,10 @@ fn image_xobject(doc: &mut Document, data: &[u8]) -> Option<(ObjRef, u32, u32)> 
             (bytes.chunks(4).flat_map(|p| p.iter().take(3).copied()).collect(), Some(bytes.chunks(4).filter_map(|p| p.get(3).copied()).collect()))
         }
         png::ColorType::Grayscale => (bytes.iter().flat_map(|g| [*g, *g, *g]).collect(), None),
-        png::ColorType::GrayscaleAlpha => {
-            (bytes.chunks(2).flat_map(|p| [p.first().copied().unwrap_or(0); 3]).collect(), Some(bytes.chunks(2).filter_map(|p| p.get(1).copied()).collect()))
-        }
+        png::ColorType::GrayscaleAlpha => (
+            bytes.chunks(2).flat_map(|p| [p.first().copied().unwrap_or(0); 3]).collect(),
+            Some(bytes.chunks(2).filter_map(|p| p.get(1).copied()).collect()),
+        ),
         png::ColorType::Indexed => return None,
     };
     d.set(b"Width".to_vec(), Object::Int(w as i64));
@@ -312,7 +315,7 @@ fn image_xobject(doc: &mut Document, data: &[u8]) -> Option<(ObjRef, u32, u32)> 
 
 /// The kind of AcroForm field an XFA `<ui>` becomes.
 #[derive(Clone, Debug, PartialEq)]
-enum Ui {
+pub(crate) enum Ui {
     Text {
         multiline: bool,
         password: bool,
@@ -333,7 +336,7 @@ enum Ui {
     Static,
 }
 
-fn ui_of(t: &Tree, field: NodeId) -> (Ui, Option<NodeId>) {
+pub(crate) fn ui_of(t: &Tree, field: NodeId) -> (Ui, Option<NodeId>) {
     let ui = t.child(field, "ui");
     let w = ui.and_then(|u| t.elements(u).find(|c| !matches!(t.tag(*c), "picture" | "extras")));
     let Some(w) = w else { return (Ui::Text { multiline: false, password: false, comb: None }, None) };
@@ -368,7 +371,7 @@ fn ui_of(t: &Tree, field: NodeId) -> (Ui, Option<NodeId>) {
 }
 
 /// Choice items: (save value, display text).
-fn items(t: &Tree, field: NodeId) -> Vec<(String, String)> {
+pub(crate) fn items(t: &Tree, field: NodeId) -> Vec<(String, String)> {
     let lists: Vec<NodeId> = t.elements(field).filter(|c| t.tag(*c) == "items").collect();
     let read = |l: NodeId| -> Vec<String> { t.elements(l).map(|e| t.text(e)).take(10_000).collect() };
     match lists.as_slice() {
@@ -467,7 +470,7 @@ impl Acro {
 }
 
 /// A PDF name for an on-state (never "Off").
-fn on_name(v: &str) -> String {
+pub(crate) fn on_name(v: &str) -> String {
     let v: String = v.chars().filter(|c| !c.is_control()).collect();
     if v.is_empty() || v == "Off" { "On".into() } else { v }
 }
@@ -792,7 +795,6 @@ impl Ctx<'_> {
                 }
                 d.set(b"MK".to_vec(), Object::Dict(mk));
                 self.finish_terminal(doc, page, d, ff, &da, 1, tooltip.as_deref(), &inst.som);
-                self.note("buttons without their scripts");
             }
             Ui::Signature => {
                 // Signature fields always show where to sign.
@@ -1098,5 +1100,5 @@ pub fn write(doc: &mut Document, t: &Tree, forms: &[Form], pages: &[Page]) -> Re
     }
     let mut notes: Vec<String> = ctx.notes.iter().map(|(k, v)| format!("{v} {k}")).collect();
     notes.sort();
-    Ok(Report { pages: pages.len(), fields: ctx.acro.count, notes })
+    Ok(Report { pages: pages.len(), fields: ctx.acro.count, notes, output: Default::default() })
 }

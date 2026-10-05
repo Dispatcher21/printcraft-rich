@@ -472,6 +472,7 @@ impl Automation {
                 self.apply(&a, Edit::SetFieldImage { name: a.str("field")?.to_owned(), image: Arc::new(bytes) })?
             }
             "form_reset" => self.form_reset(&a)?,
+            "form_press_button" => self.form_press_button(&a)?,
             "form_add_field" => self.form_add_field(&a)?,
             "form_set_props" => self.form_set_props(&a)?,
             "form_delete_field" => self.form_delete_field(&a)?,

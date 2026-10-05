@@ -42,6 +42,28 @@ pub struct Inst {
     pub value: String,
     pub children: Vec<usize>,
     pub presence: Presence,
+    /// Property changes scripts made to this instance (kept across edits; see `dom`).
+    pub ops: Vec<Op>,
+}
+
+/// What a property change sets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Key {
+    /// An attribute of the element at the path.
+    Attr(String),
+    /// The text content of the element at the path.
+    Text,
+    /// The whole item list of a choice list: (save, display) pairs.
+    Items,
+}
+
+/// A script's change to one property of one instance: the element at `path` below the
+/// instance's template node (e.g. `["border", "fill", "color"]`) and what it sets there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Op {
+    pub path: Vec<String>,
+    pub key: Key,
+    pub value: String,
 }
 
 /// The merged form: an arena of instances; index 0 is the root subform.
@@ -83,7 +105,7 @@ impl Data<'_> {
         Some(self.path_of(hit))
     }
 
-    fn path_of(&self, mut n: NodeId) -> DataPath {
+    pub(crate) fn path_of(&self, mut n: NodeId) -> DataPath {
         let mut out = Vec::new();
         while Some(n) != self.root {
             let Some(p) = self.tree.parent(n) else { break };
@@ -122,7 +144,7 @@ struct Merger<'a> {
     form: Form,
 }
 
-fn occur(t: &Tree, n: NodeId) -> (usize, usize, usize) {
+pub(crate) fn occur(t: &Tree, n: NodeId) -> (usize, usize, usize) {
     let Some(o) = t.child(n, "occur") else { return (1, 1, 1) };
     let num = |k: &str| t.attr(o, k).and_then(|v| v.trim().parse::<i64>().ok());
     let min = num("min").unwrap_or(1).clamp(0, MAX_REPEAT as i64) as usize;
@@ -135,7 +157,7 @@ fn occur(t: &Tree, n: NodeId) -> (usize, usize, usize) {
     (min, max, initial)
 }
 
-fn bind_of(t: &Tree, n: NodeId) -> (String, Option<String>) {
+pub(crate) fn bind_of(t: &Tree, n: NodeId) -> (String, Option<String>) {
     match t.child(n, "bind") {
         Some(b) => (t.attr(b, "match").unwrap_or("once").to_string(), t.attr(b, "ref").map(str::to_string)),
         None => ("once".to_string(), None),
@@ -227,6 +249,7 @@ impl Merger<'_> {
                         value: String::new(),
                         children: inner,
                         presence: template::presence(self.t, c),
+                        ops: Vec::new(),
                     };
                     if let Some(i) = self.push(inst) {
                         out.push(i);
@@ -243,6 +266,7 @@ impl Merger<'_> {
                         value: self.default_value(c),
                         children: Vec::new(),
                         presence: template::presence(self.t, c),
+                        ops: Vec::new(),
                     };
                     if let Some(i) = self.push(inst) {
                         out.push(i);
@@ -292,31 +316,37 @@ impl Merger<'_> {
             }
         }
         for plan in plans {
-            let mut inner = Vec::new();
-            match &plan {
-                Some(p) => {
-                    let mut sub = Ctx { path: p.clone(), consumed: HashMap::new() };
-                    self.children(c, &mut sub, &mut inner, depth + 1);
-                }
-                // Unbound and unnamed subforms are transparent: their content binds in the
-                // enclosing data group.
-                None => self.children(c, ctx, &mut inner, depth + 1),
-            }
-            let inst = Inst {
-                t: c,
-                tag: Tag::Subform,
-                name: name.clone(),
-                som: String::new(),
-                data: plan,
-                value: String::new(),
-                children: inner,
-                presence: template::presence(self.t, c),
-            };
-            match self.push(inst) {
+            match self.instance(c, plan, ctx, depth) {
                 Some(i) => out.push(i),
                 None => return,
             }
         }
+    }
+
+    /// One instance of subform `c`, bound to `plan` (or transparent in `ctx` when `None`).
+    fn instance(&mut self, c: NodeId, plan: Option<DataPath>, ctx: &mut Ctx, depth: usize) -> Option<usize> {
+        let mut inner = Vec::new();
+        match &plan {
+            Some(p) => {
+                let mut sub = Ctx { path: p.clone(), consumed: HashMap::new() };
+                self.children(c, &mut sub, &mut inner, depth + 1);
+            }
+            // Unbound and unnamed subforms are transparent: their content binds in the
+            // enclosing data group.
+            None => self.children(c, ctx, &mut inner, depth + 1),
+        }
+        let inst = Inst {
+            t: c,
+            tag: Tag::Subform,
+            name: self.t.attr(c, "name").unwrap_or("").to_string(),
+            som: String::new(),
+            data: plan,
+            value: String::new(),
+            children: inner,
+            presence: template::presence(self.t, c),
+            ops: Vec::new(),
+        };
+        self.push(inst)
     }
 
     fn field(&mut self, c: NodeId, ctx: &mut Ctx, out: &mut Vec<usize>, depth: usize) {
@@ -355,6 +385,7 @@ impl Merger<'_> {
                     value: self.default_value(m),
                     children: Vec::new(),
                     presence: template::presence(self.t, m),
+                    ops: Vec::new(),
                 };
                 if let Some(i) = self.push(inst) {
                     children.push(i);
@@ -379,6 +410,7 @@ impl Merger<'_> {
             value: value.unwrap_or_else(|| self.default_value(c)),
             children,
             presence: template::presence(self.t, c),
+            ops: Vec::new(),
         };
         if let Some(i) = self.push(inst) {
             out.push(i);
@@ -396,7 +428,7 @@ pub fn check_values(t: &Tree, field: NodeId) -> (String, String) {
 
 /// Assign SOM names: `name[i]` with `i` counting same-named siblings; unnamed subforms are
 /// `#subform[i]`, unnamed fields `#field[i]`. Areas don't appear in SOM paths.
-fn name_tree(form: &mut Form, i: usize, prefix: &str, depth: usize) {
+pub(crate) fn name_tree(form: &mut Form, i: usize, prefix: &str, depth: usize) {
     if depth > MAX_DEPTH {
         return;
     }
@@ -422,7 +454,7 @@ fn name_tree(form: &mut Form, i: usize, prefix: &str, depth: usize) {
     }
 }
 
-fn flatten_areas(form: &Form, kids: &[usize], depth: usize) -> Vec<usize> {
+pub(crate) fn flatten_areas(form: &Form, kids: &[usize], depth: usize) -> Vec<usize> {
     let mut out = Vec::new();
     for k in kids {
         match form.insts.get(*k) {
@@ -453,6 +485,7 @@ pub fn merge(t: &Tree, root_subform: NodeId, data_tree: &Tree, data_root: Option
         value: String::new(),
         children: Vec::new(),
         presence: Presence::Visible,
+        ops: Vec::new(),
     });
     let mut ctx = Ctx { path, consumed: HashMap::new() };
     let mut kids = Vec::new();
@@ -463,6 +496,25 @@ pub fn merge(t: &Tree, root_subform: NodeId, data_tree: &Tree, data_root: Option
     let root_som = m.form.insts.first().map(|r| r.som.clone()).unwrap_or_default();
     name_tree(&mut m.form, 0, &root_som, 0);
     m.form
+}
+
+/// Merge one new instance of subform template `c` into `form` (for `instanceManager`), bound to
+/// the data group at `path` (`None`: unbound; its content then binds under `context`). Returns
+/// the new instance; the caller links it into its parent and names it.
+pub(crate) fn merge_one(
+    t: &Tree,
+    data_tree: &Tree,
+    data_root: Option<NodeId>,
+    form: &mut Form,
+    c: NodeId,
+    path: Option<DataPath>,
+    context: DataPath,
+) -> Option<usize> {
+    let mut m = Merger { t, data: Data { tree: data_tree, root: data_root }, form: std::mem::take(form) };
+    let mut ctx = Ctx { path: context, consumed: HashMap::new() };
+    let i = m.instance(c, path, &mut ctx, 1);
+    *form = m.form;
+    i
 }
 
 /// Merge the content of a page area (master page) for one page: fields there bind globally by
@@ -478,6 +530,7 @@ pub fn merge_page_area(t: &Tree, page_area: NodeId, data_tree: &Tree, data_root:
         value: String::new(),
         children: Vec::new(),
         presence: Presence::Visible,
+        ops: Vec::new(),
     });
     let mut ctx = Ctx { path: Vec::new(), consumed: HashMap::new() };
     let mut kids = Vec::new();

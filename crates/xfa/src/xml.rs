@@ -234,6 +234,39 @@ impl Tree {
         Some(top)
     }
 
+    /// Copy the subtree at `src` under `parent` in this same tree; returns the copy's id.
+    pub fn copy_within(&mut self, src: NodeId, parent: NodeId) -> Option<NodeId> {
+        // Collect the subtree first (kinds with their parent's position in the list), so the
+        // copy never reads nodes it is adding.
+        let mut nodes: Vec<(Kind, Option<usize>)> = Vec::new();
+        let mut stack: Vec<(NodeId, Option<usize>, usize)> = vec![(src, None, 0)];
+        while let Some((n, up, depth)) = stack.pop() {
+            let Some(node) = self.nodes.get(n) else { continue };
+            if depth > MAX_DEPTH || nodes.len().saturating_add(self.nodes.len()) > MAX_NODES {
+                break;
+            }
+            nodes.push((node.kind.clone(), up));
+            let me = nodes.len() - 1;
+            stack.extend(node.children.iter().rev().map(|c| (*c, Some(me), depth + 1)));
+        }
+        let mut made: Vec<NodeId> = Vec::with_capacity(nodes.len());
+        for (kind, up) in nodes {
+            let p = up.and_then(|i| made.get(i).copied()).unwrap_or(parent);
+            made.push(self.append(p, kind));
+        }
+        made.first().copied()
+    }
+
+    /// List `child` among `parent`'s children too, without moving it: the child keeps its own
+    /// parent. Shallow copies of template containers share their container children this way.
+    pub fn share_child(&mut self, parent: NodeId, child: NodeId) {
+        if child < self.nodes.len()
+            && let Some(p) = self.nodes.get_mut(parent)
+        {
+            p.children.push(child);
+        }
+    }
+
     /// Every element in document order below `id` (excluding `id`), depth-limited.
     pub fn descendants(&self, id: NodeId) -> Vec<NodeId> {
         let mut out = Vec::new();

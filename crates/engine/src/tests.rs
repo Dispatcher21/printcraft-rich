@@ -1415,6 +1415,11 @@ fn guard_turns_a_panic_into_an_error() {
 fn xfa_fixture() -> Vec<u8> {
     let template = r#"<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form1" layout="tb"><pageSet><pageArea name="P"><contentArea x="0.5in" y="0.5in" w="7.5in" h="10in"/><medium stock="letter"/></pageArea></pageSet><subform name="Page1" w="7.5in" h="2in"><draw name="Title" w="7.5in" h="0.5in"><value><text>SYNTHETIC FORM</text></value></draw><field name="Name" y="1in" w="4in" h="0.4in"><ui><textEdit/></ui></field></subform></subform></template>"#;
     let datasets = r#"<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form1><Page1><Name>Ann</Name></Page1></form1></xfa:data></xfa:datasets>"#;
+    xfa_fixture_with(template, datasets)
+}
+
+/// A dynamic XFA PDF from a template and datasets packet.
+fn xfa_fixture_with(template: &str, datasets: &str) -> Vec<u8> {
     let stream = |d: &str| format!("<< /Length {} >>\nstream\n{d}\nendstream", d.len()).into_bytes();
     let objs: Vec<Vec<u8>> = vec![
         b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R /NeedsRendering true >>".to_vec(),
@@ -1469,4 +1474,70 @@ fn dynamic_xfa_forms_open_as_fillable_pages_and_save_into_the_xfa_data() {
     let again = s.open("saved.pdf", None, saved, None).unwrap();
     let name = s.get(again).unwrap().form.iter().find(|f| f.name == "form1[0].Page1[0].Name[0]").cloned().unwrap();
     assert_eq!(name.value, vec!["Bea".to_string()]);
+}
+
+/// A scripted dynamic XFA form: a table whose rows calculate (JavaScript), a FormCalc total,
+/// an Add Row button and a button that shows a message.
+fn scripted_xfa_fixture() -> Vec<u8> {
+    let template = r##"<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form1" layout="tb">
+      <pageSet><pageArea name="P"><contentArea x="0.5in" y="0.5in" w="7.5in" h="10in"/><medium stock="letter"/></pageArea></pageSet>
+      <subform name="Items" layout="tb" w="7.5in">
+        <subform name="Row" layout="lr-tb" w="7.5in"><occur min="1" max="-1"/>
+          <field name="Qty" w="1in" h="0.3in"><ui><numericEdit/></ui><value><integer/></value></field>
+          <field name="Price" w="1in" h="0.3in"><ui><numericEdit/></ui><value><decimal/></value></field>
+          <field name="Amount" w="1.5in" h="0.3in" access="readOnly"><ui><numericEdit/></ui><value><decimal/></value>
+            <calculate><script contentType="application/x-javascript">Qty.rawValue * Price.rawValue</script></calculate></field>
+        </subform>
+        <field name="AddRow" w="1in" h="0.3in"><ui><button/></ui><caption><value><text>Add</text></value></caption>
+          <event activity="click"><script contentType="application/x-javascript">_Row.addInstance(1);</script></event></field>
+        <field name="Hello" w="1in" h="0.3in"><ui><button/></ui><caption><value><text>Hello</text></value></caption>
+          <event activity="click"><script contentType="application/x-javascript">xfa.host.messageBox("Rows: " + _Row.count);</script></event></field>
+      </subform>
+      <field name="Total" w="2in" h="0.3in" access="readOnly"><ui><numericEdit/></ui><value><decimal/></value>
+        <calculate><script>Sum(Items.Row[*].Amount)</script></calculate></field>
+    </subform></template>"##;
+    let datasets = r#"<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form1><Items><Row><Qty>2</Qty><Price>5</Price></Row></Items></form1></xfa:data></xfa:datasets>"#;
+    xfa_fixture_with(template, datasets)
+}
+
+#[test]
+fn xfa_scripts_run_when_filling_and_pressing_buttons() {
+    let mut s = Session::new();
+    let id = s.open("form.pdf", None, Arc::new(scripted_xfa_fixture()), None).unwrap();
+    let value = |s: &Session, name: &str| s.get(id).unwrap().form.iter().find(|f| f.name == name).map(|f| f.value.clone());
+    let names = |s: &Session| s.get(id).unwrap().form.iter().map(|f| f.name.clone()).collect::<Vec<_>>();
+    // Opening ran the calculations.
+    assert_eq!(value(&s, "form1[0].Items[0].Row[0].Amount[0]"), Some(vec!["10".to_string()]));
+    assert_eq!(value(&s, "form1[0].Total[0]"), Some(vec!["10".to_string()]));
+    assert!(!s.get(id).unwrap().dirty);
+    // Filling recalculates.
+    s.apply(id, Edit::SetFieldValue { name: "form1[0].Items[0].Row[0].Qty[0]".into(), value: FieldValue::Text("3".into()) }).unwrap();
+    assert_eq!(value(&s, "form1[0].Total[0]"), Some(vec!["15".to_string()]));
+    // Add Row lays the form out again with a new row; undo takes it away.
+    s.apply(id, Edit::PressXfaButton { name: "form1[0].Items[0].AddRow[0]".into() }).unwrap();
+    assert!(names(&s).iter().any(|n| n == "form1[0].Items[0].Row[1].Qty[0]"), "{:?}", names(&s));
+    assert_eq!(s.undo(id).unwrap(), "Press AddRow");
+    assert!(!names(&s).iter().any(|n| n.contains("Row[1]")));
+    s.redo(id).unwrap();
+    s.apply(id, Edit::SetFieldValue { name: "form1[0].Items[0].Row[1].Qty[0]".into(), value: FieldValue::Text("1".into()) }).unwrap();
+    s.apply(id, Edit::SetFieldValue { name: "form1[0].Items[0].Row[1].Price[0]".into(), value: FieldValue::Text("2.5".into()) }).unwrap();
+    assert_eq!(value(&s, "form1[0].Total[0]"), Some(vec!["17.5".to_string()]));
+    // Messages come back as script output.
+    let _ = s.take_js_output(id);
+    s.apply(id, Edit::PressXfaButton { name: "form1[0].Items[0].Hello[0]".into() }).unwrap();
+    assert_eq!(s.take_js_output(id).alerts, vec!["Rows: 2".to_string()]);
+    // A field without click scripts, and scripts turned off, are refused.
+    assert!(s.apply(id, Edit::PressXfaButton { name: "form1[0].Total[0]".into() }).is_err());
+    s.set_javascript(false);
+    let off = s.apply(id, Edit::PressXfaButton { name: "form1[0].Items[0].AddRow[0]".into() }).unwrap_err().to_string();
+    assert!(off.contains("JavaScript is turned off"), "{off}");
+    s.set_javascript(true);
+    // Saved and reopened: the rows and values are in the data.
+    let saved = s.save_bytes(id).unwrap();
+    let again = s.open("saved.pdf", None, saved, None).unwrap();
+    let total = s.get(again).unwrap().form.iter().find(|f| f.name == "form1[0].Total[0]").map(|f| f.value.clone());
+    assert_eq!(total, Some(vec!["17.5".to_string()]));
+    // Documents without XFA have no XFA buttons.
+    let plain = s.open("plain.pdf", None, Arc::new(form_fixture()), None).unwrap();
+    assert!(s.apply(plain, Edit::PressXfaButton { name: "x".into() }).is_err());
 }

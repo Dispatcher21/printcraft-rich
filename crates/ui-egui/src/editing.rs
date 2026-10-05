@@ -30,6 +30,7 @@ impl PrintCraftApp {
     pub fn apply_edit(&mut self, edit: Edit) -> bool {
         let Some((i, id)) = self.active_ids() else { return false };
         let label = edit.label();
+        let plain_error = matches!(edit, Edit::PressXfaButton { .. });
         match self.session.apply(id, edit.clone()) {
             Ok(()) => {
                 let Some(doc) = self.session.get(id) else { return true };
@@ -64,6 +65,10 @@ impl PrintCraftApp {
                 let out = self.session.take_js_output(id);
                 self.handle_js(id, out);
                 true
+            }
+            Err(e) if plain_error => {
+                self.notify(e.to_string());
+                false
             }
             Err(e) => {
                 self.notify(format!("{label} failed: {e}"));

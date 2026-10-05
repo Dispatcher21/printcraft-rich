@@ -1504,3 +1504,69 @@ fn exporting_to_word_html_and_rtf() {
     assert!(std::fs::read_to_string(dir.join("a.rtf")).unwrap().contains("Page 2"));
     assert!(a.call("doc_export_office", &json!({ "doc": doc, "path": "a.xyz" })).is_err());
 }
+
+/// A scripted dynamic XFA form: rows that calculate, a FormCalc total and an Add Row button.
+fn scripted_xfa() -> Vec<u8> {
+    let template = r##"<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form1" layout="tb">
+      <pageSet><pageArea name="P"><contentArea x="0.5in" y="0.5in" w="7.5in" h="10in"/><medium stock="letter"/></pageArea></pageSet>
+      <subform name="Items" layout="tb" w="7.5in">
+        <subform name="Row" layout="lr-tb" w="7.5in"><occur min="1" max="-1"/>
+          <field name="Qty" w="1in" h="0.3in"><ui><numericEdit/></ui><value><integer/></value></field>
+          <field name="Amount" w="1.5in" h="0.3in" access="readOnly"><ui><numericEdit/></ui><value><decimal/></value>
+            <calculate><script contentType="application/x-javascript">Qty.rawValue * 4</script></calculate></field>
+        </subform>
+        <field name="AddRow" w="1in" h="0.3in"><ui><button/></ui><caption><value><text>Add</text></value></caption>
+          <event activity="click"><script contentType="application/x-javascript">_Row.addInstance(1); xfa.host.messageBox("Added");</script></event></field>
+      </subform>
+      <field name="Total" w="2in" h="0.3in" access="readOnly"><ui><numericEdit/></ui><value><decimal/></value>
+        <calculate><script>Sum(Items.Row[*].Amount)</script></calculate></field>
+    </subform></template>"##;
+    let datasets = r#"<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form1><Items><Row><Qty>1</Qty></Row></Items></form1></xfa:data></xfa:datasets>"#;
+    let stream = |d: &str| format!("<< /Length {} >>\nstream\n{d}\nendstream", d.len()).into_bytes();
+    let objs: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R /NeedsRendering true >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+        b"<< /Fields [] /XFA [(preamble) 5 0 R (template) 6 0 R (datasets) 7 0 R (postamble) 8 0 R] >>".to_vec(),
+        stream(r#"<xdp:xdp xmlns:xdp="http://ns.adobe.com/xdp/">"#),
+        stream(template),
+        stream(datasets),
+        stream("</xdp:xdp>"),
+    ];
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, o) in objs.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        out.extend_from_slice(o);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+    for o in offsets {
+        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).as_bytes());
+    out
+}
+
+#[test]
+fn xfa_scripts_through_tools() {
+    let dir = workdir("xfa-scripts");
+    std::fs::write(dir.join("xfa.pdf"), scripted_xfa()).unwrap();
+    let mut a = auto(&dir);
+    let doc = ok(&mut a, "doc_open", json!({ "path": "xfa.pdf" }))["doc"].as_u64().unwrap();
+    let get = |a: &mut Automation, name: &str| -> Value {
+        let all = ok(a, "form_fields", json!({ "doc": doc }));
+        all["fields"].as_array().unwrap().iter().find(|f| f["name"] == name).map(|f| f["value"].clone()).unwrap_or(Value::Null)
+    };
+    assert_eq!(get(&mut a, "form1[0].Total[0]"), "4");
+    ok(&mut a, "form_fill", json!({ "doc": doc, "values": { "form1[0].Items[0].Row[0].Qty[0]": "3" } }));
+    assert_eq!(get(&mut a, "form1[0].Items[0].Row[0].Amount[0]"), "12");
+    let r = ok(&mut a, "form_press_button", json!({ "doc": doc, "field": "form1[0].Items[0].AddRow[0]" }));
+    assert_eq!(r["messages"], json!(["Added"]), "{r}");
+    ok(&mut a, "form_fill", json!({ "doc": doc, "values": { "form1[0].Items[0].Row[1].Qty[0]": "2" } }));
+    assert_eq!(get(&mut a, "form1[0].Total[0]"), "20");
+    assert!(matches!(a.call("form_press_button", &json!({ "doc": doc, "field": "nope" })), Err(ToolError::Failed(_))));
+    assert!(matches!(a.call("form_press_button", &json!({ "doc": doc, "field": "form1[0].Total[0]" })), Err(ToolError::Failed(_))));
+}
