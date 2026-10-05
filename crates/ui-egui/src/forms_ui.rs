@@ -8,6 +8,7 @@ use egui::{Color32, CornerRadius, Rect, Stroke, vec2};
 use printcraft_engine::{Edit, FieldValue, FormField, FormFieldKind, field_flags};
 use printcraft_render::DocInfo;
 
+use crate::PrintCraftApp;
 use crate::canvas::{DocView, PageXform};
 use crate::theme::Tokens;
 
@@ -38,6 +39,59 @@ pub struct FormView {
     pub notice: Option<String>,
     /// A push button was clicked: (its field name, what it does).
     pub button: Option<(String, printcraft_engine::form_scripts::ButtonAction)>,
+    /// XFA fields whose click scripts run when clicked (a pick list, a toggle, …).
+    pub xfa_clickable: std::sync::Arc<Vec<String>>,
+}
+
+/// An XFA form's pop-up menu waiting for a pick (`app.popUpMenuEx`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct XfaMenu {
+    pub field: String,
+    /// (label, value)
+    pub items: Vec<(String, String)>,
+    /// Earlier answers in the same click.
+    pub answers: Vec<Option<String>>,
+    /// Where the menu opens (the click).
+    pub at: Option<egui::Pos2>,
+}
+
+impl PrintCraftApp {
+    /// Show the pending XFA pop-up menu; a pick runs the click again with the answer.
+    pub fn show_xfa_menu(&mut self, ctx: &egui::Context) {
+        let Some(menu) = self.xfa_menu.clone() else { return };
+        let mut picked: Option<String> = None;
+        let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let at = menu.at.unwrap_or_else(|| ctx.content_rect().center());
+        let area = egui::Area::new(egui::Id::new(("xfa-menu", &menu.field))).order(egui::Order::Foreground).fixed_pos(at).show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_min_width(220.0);
+                egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
+                    for (label, value) in &menu.items {
+                        let shown = if label.trim().is_empty() { "(blank)" } else { label.as_str() };
+                        if ui.add(egui::Button::new(shown).frame(false).min_size(vec2(ui.available_width(), 0.0))).clicked() {
+                            picked = Some(value.clone());
+                        }
+                    }
+                });
+            });
+        });
+        // A click elsewhere dismisses the menu (and changes nothing).
+        if picked.is_none()
+            && ctx.input(|i| i.pointer.any_pressed())
+            && let Some(p) = ctx.input(|i| i.pointer.interact_pos())
+            && !area.response.rect.contains(p)
+        {
+            close = true;
+        }
+        if let Some(v) = picked {
+            self.xfa_menu = None;
+            let mut answers = menu.answers.clone();
+            answers.push(Some(v));
+            self.apply_edit(Edit::PressXfaButton { name: menu.field.clone(), answers });
+        } else if close {
+            self.xfa_menu = None;
+        }
+    }
 }
 
 fn widget_rect(xf: &PageXform, info: &DocInfo, page: usize, r: [f64; 4]) -> Rect {
@@ -95,12 +149,17 @@ pub(crate) fn page_input(
     }
     match f.kind {
         _ if f.read_only() => view.forms.notice = Some(format!("{} is read-only", f.name)),
+        // XFA fields with click scripts (a rank or leave-type pick list): run them.
+        FormFieldKind::Text | FormFieldKind::Combo | FormFieldKind::List if view.forms.xfa_clickable.contains(&f.name) => {
+            view.forms.focus = None;
+            view.pending_edit = Some(Edit::PressXfaButton { name: f.name.clone(), answers: Vec::new() });
+        }
         FormFieldKind::PushButton => match &f.button {
             Some(a) => view.forms.button = Some((f.name.clone(), a.clone())),
             // XFA buttons (named by SOM, `form1[0].…[0]`) act through the form's scripts.
             None if f.name.ends_with(']') => {
                 view.forms.focus = None;
-                view.pending_edit = Some(Edit::PressXfaButton { name: f.name.clone() });
+                view.pending_edit = Some(Edit::PressXfaButton { name: f.name.clone(), answers: Vec::new() });
             }
             None => view.forms.notice = Some(format!("{} has no action", f.name)),
         },

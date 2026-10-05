@@ -227,7 +227,7 @@ pub fn realize_with(doc: &mut Document, opts: &Options) -> Result<Report, XfaErr
     let (mut live, output, pages) = if opts.scripts && scripted {
         let today = opts.today;
         let ran = script::on_thread(move || -> Result<(dom::Live, Output, Vec<layout::Page>), String> {
-            let mut engine = script::Engine::new(host::Host::new(live, today))?;
+            let mut engine = script::Engine::new(new_host(live, today, HashSet::new(), Vec::new()))?;
             script::open(&mut engine);
             let pages = lay_out_scripted(&mut engine, true);
             let (live, out) = script::finish(engine).ok_or("the scripts' results were lost")?;
@@ -280,7 +280,55 @@ pub fn after_edit(doc: &mut Document, edited: &[String], opts: &Options) -> Resu
 /// Press button `field` (its AcroForm name): its `click` scripts (add a row, show a section,
 /// …) run, then the calculations.
 pub fn click(doc: &mut Document, field: &str, opts: &Options) -> Result<Outcome, XfaError> {
-    run_job(doc, opts, Job::Click(dom::normalize(field)))
+    click_answering(doc, field, &[], opts)
+}
+
+/// [`click`], answering the pop-up menus its scripts show (`app.popUpMenuEx`) in order
+/// (`None`: dismissed). When a script asks a question with no answer left, nothing changes
+/// and [`Outcome::output`]'s `ask` lists the choices: show them, then call again with the
+/// answer appended.
+pub fn click_answering(doc: &mut Document, field: &str, answers: &[Option<String>], opts: &Options) -> Result<Outcome, XfaError> {
+    run_job(doc, opts, Job::Click(dom::normalize(field), answers.to_vec()))
+}
+
+/// Before signing field `field`: its `preSign` scripts (stamp the date, lock fields), then the
+/// calculations.
+pub fn before_sign(doc: &mut Document, field: &str, opts: &Options) -> Result<Outcome, XfaError> {
+    run_job(doc, opts, Job::PreSign(dom::normalize(field)))
+}
+
+/// The fields with `click` scripts (AcroForm names): clicking them runs scripts, such as a
+/// pop-up menu that fills the field.
+pub fn clickable(doc: &Document) -> Vec<String> {
+    let Ok(live) = load(doc) else { return Vec::new() };
+    live.walk(0)
+        .into_iter()
+        .filter(|n| live.inst(*n).is_some_and(|i| i.tag == merge::Tag::Field && !i.som.is_empty()))
+        .filter(|n| ["click", "mouseUp", "mouseDown"].iter().any(|a| !script::event_scripts(&live, *n, a, "$").is_empty()))
+        .filter_map(|n| live.inst(n).map(|i| i.som.clone()))
+        .collect()
+}
+
+/// Signature fields that are signed (normalized AcroForm names).
+fn signed_fields(doc: &Document) -> HashSet<String> {
+    printcraft_forms::fields(doc)
+        .into_iter()
+        .filter(|f| f.kind == printcraft_forms::FieldKind::Signature && doc.get(f.obj).as_dict().is_some_and(|d| d.get(b"V").is_some()))
+        .map(|f| dom::normalize(&f.name))
+        .collect()
+}
+
+/// Whether any signature field is signed: such a form keeps its pages (laying them out again
+/// would show as a change to what was signed); scripts still update values and field locks.
+pub fn is_signed(doc: &Document) -> bool {
+    !signed_fields(doc).is_empty()
+}
+
+fn new_host(live: dom::Live, today: (i32, u32, u32), signed: HashSet<String>, answers: Vec<Option<String>>) -> host::Host {
+    let mut h = host::Host::new(live, today);
+    h.signed = signed;
+    h.answers = answers.into();
+    h
 }
 
 /// Whether field `field` has `click` scripts (so pressing it does something).
@@ -299,16 +347,18 @@ fn button_named(live: &dom::Live, field: &str) -> Option<dom::N> {
 enum Job {
     Open,
     Edit(HashSet<String>),
-    Click(String),
+    Click(String, Vec<Option<String>>),
+    PreSign(String),
 }
 
 fn run_job(doc: &mut Document, opts: &Options, job: Job) -> Result<Outcome, XfaError> {
     let k = kind(doc).ok_or(XfaError::NoXfa)?;
     let mut live = load(doc)?;
+    live.frozen = is_signed(doc);
     let changed = live.read_acroform(doc);
     let scripted = opts.scripts && script::has_scripts(&live);
     if !scripted {
-        if matches!(job, Job::Click(_)) {
+        if matches!(job, Job::Click(..) | Job::PreSign(_)) {
             return Ok(Outcome::default());
         }
         live.save(doc)?;
@@ -323,24 +373,36 @@ fn run_job(doc: &mut Document, opts: &Options, job: Job) -> Result<Outcome, XfaE
         _ => Vec::new(),
     };
     let target = match &job {
-        Job::Click(name) => Some(button_named(&live, name).ok_or_else(|| XfaError::NoField(name.clone()))?),
+        Job::Click(name, _) | Job::PreSign(name) => Some(button_named(&live, name).ok_or_else(|| XfaError::NoField(name.clone()))?),
         _ => None,
     };
+    let answers = match &job {
+        Job::Click(_, a) => a.clone(),
+        _ => Vec::new(),
+    };
+    let pre_sign = matches!(job, Job::PreSign(_));
+    let signed = signed_fields(doc);
+    let frozen = !signed.is_empty();
     live.layout_changed = false;
     live.changed.clear();
     let dynamic = k == Kind::Dynamic;
     let today = opts.today;
     let open = matches!(job, Job::Open);
     let ran = script::on_thread(move || -> Result<(dom::Live, Output, Vec<layout::Page>), String> {
-        let mut engine = script::Engine::new(host::Host::new(live, today))?;
+        let mut engine = script::Engine::new(new_host(live, today, signed, answers))?;
         if open {
             script::open(&mut engine);
         } else if let Some(n) = target {
-            script::click(&mut engine, n);
+            if pre_sign {
+                script::pre_sign(&mut engine, n);
+            } else {
+                script::click(&mut engine, n);
+            }
         } else {
             script::edit(&mut engine, &changes);
         }
-        let relayout = dynamic && engine.host().is_some_and(|h| h.live.layout_changed);
+        let asking = engine.host().is_some_and(|h| h.out.ask.is_some());
+        let relayout = dynamic && !frozen && !asking && engine.host().is_some_and(|h| h.live.layout_changed);
         let pages = if relayout { lay_out_scripted(&mut engine, false) } else { Vec::new() };
         let (live, out) = script::finish(engine).ok_or("the scripts' results were lost")?;
         Ok((live, out, pages))
@@ -357,13 +419,18 @@ fn run_job(doc: &mut Document, opts: &Options, job: Job) -> Result<Outcome, XfaE
             return Ok(Outcome { output, relaid: false, values: 0 });
         }
     };
+    // A script is waiting for the user's choice: change nothing until it's answered.
+    if output.ask.is_some() {
+        return Ok(Outcome { output, relaid: false, values: 0 });
+    }
+    live.frozen = frozen;
     let mut outcome = Outcome { output, relaid: false, values: live.changed.len() };
     if !pages.is_empty() {
         realize::write(doc, &live.xdp.tree, &live.forms, &pages)?;
         outcome.relaid = true;
     } else {
         outcome.values = live.write_values(doc)?;
-        if !dynamic {
+        if !dynamic || frozen {
             apply_static(doc, &live)?;
         }
     }
@@ -413,6 +480,7 @@ fn apply_static(doc: &mut Document, live: &dom::Live) -> Result<(), XfaError> {
 /// /UR3`), which the change invalidates, is removed.
 pub fn sync_datasets(doc: &mut Document) -> Result<usize, XfaError> {
     let mut live = load(doc)?;
+    live.frozen = is_signed(doc);
     let changed = live.read_acroform(doc).len();
     if changed > 0 {
         live.save(doc)?;

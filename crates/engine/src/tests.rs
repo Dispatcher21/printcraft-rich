@@ -1514,7 +1514,7 @@ fn xfa_scripts_run_when_filling_and_pressing_buttons() {
     s.apply(id, Edit::SetFieldValue { name: "form1[0].Items[0].Row[0].Qty[0]".into(), value: FieldValue::Text("3".into()) }).unwrap();
     assert_eq!(value(&s, "form1[0].Total[0]"), Some(vec!["15".to_string()]));
     // Add Row lays the form out again with a new row; undo takes it away.
-    s.apply(id, Edit::PressXfaButton { name: "form1[0].Items[0].AddRow[0]".into() }).unwrap();
+    s.apply(id, Edit::PressXfaButton { name: "form1[0].Items[0].AddRow[0]".into(), answers: Vec::new() }).unwrap();
     assert!(names(&s).iter().any(|n| n == "form1[0].Items[0].Row[1].Qty[0]"), "{:?}", names(&s));
     assert_eq!(s.undo(id).unwrap(), "Press AddRow");
     assert!(!names(&s).iter().any(|n| n.contains("Row[1]")));
@@ -1524,12 +1524,12 @@ fn xfa_scripts_run_when_filling_and_pressing_buttons() {
     assert_eq!(value(&s, "form1[0].Total[0]"), Some(vec!["17.5".to_string()]));
     // Messages come back as script output.
     let _ = s.take_js_output(id);
-    s.apply(id, Edit::PressXfaButton { name: "form1[0].Items[0].Hello[0]".into() }).unwrap();
+    s.apply(id, Edit::PressXfaButton { name: "form1[0].Items[0].Hello[0]".into(), answers: Vec::new() }).unwrap();
     assert_eq!(s.take_js_output(id).alerts, vec!["Rows: 2".to_string()]);
     // A field without click scripts, and scripts turned off, are refused.
-    assert!(s.apply(id, Edit::PressXfaButton { name: "form1[0].Total[0]".into() }).is_err());
+    assert!(s.apply(id, Edit::PressXfaButton { name: "form1[0].Total[0]".into(), answers: Vec::new() }).is_err());
     s.set_javascript(false);
-    let off = s.apply(id, Edit::PressXfaButton { name: "form1[0].Items[0].AddRow[0]".into() }).unwrap_err().to_string();
+    let off = s.apply(id, Edit::PressXfaButton { name: "form1[0].Items[0].AddRow[0]".into(), answers: Vec::new() }).unwrap_err().to_string();
     assert!(off.contains("JavaScript is turned off"), "{off}");
     s.set_javascript(true);
     // Saved and reopened: the rows and values are in the data.
@@ -1539,5 +1539,71 @@ fn xfa_scripts_run_when_filling_and_pressing_buttons() {
     assert_eq!(total, Some(vec!["17.5".to_string()]));
     // Documents without XFA have no XFA buttons.
     let plain = s.open("plain.pdf", None, Arc::new(form_fixture()), None).unwrap();
-    assert!(s.apply(plain, Edit::PressXfaButton { name: "x".into() }).is_err());
+    assert!(s.apply(plain, Edit::PressXfaButton { name: "x".into(), answers: Vec::new() }).is_err());
+}
+
+/// Government forms are often encrypted with only a permissions password: they sign like any
+/// other document (the signature's /Contents stays unencrypted) and validate after reopening.
+#[test]
+fn signing_an_encrypted_document() {
+    let p12 = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../sign/tests/data/ec-p256.p12")).unwrap();
+    let digital_id = sign::pkcs12::open(&p12, "test").unwrap();
+    let mut s = Session::new().with_clock(|| 1_800_000_000);
+    let id = s.open("fixture.pdf", None, Arc::new(fixture(1)), None).unwrap();
+    s.apply(id, Edit::Protect(Protection { changes: Changes::CommentFillSign, ..protection(None, Some("owner")) })).unwrap();
+    let saved = s.save_bytes(id).unwrap();
+    // With no changes allowed, signing is refused.
+    let mut locked = Session::new().with_clock(|| 1_800_000_000);
+    let lid = locked.open("fixture.pdf", None, Arc::new(fixture(1)), None).unwrap();
+    locked.apply(lid, Edit::Protect(protection(None, Some("owner")))).unwrap();
+    let lbytes = locked.save_bytes(lid).unwrap();
+    let lid = locked.open("locked.pdf", None, lbytes, None).unwrap();
+    assert!(locked.sign(lid, &digital_id, SignOptions { rect: Some([20.0, 20.0, 180.0, 60.0]), ..SignOptions::default() }).is_err());
+    let id = s.open("protected.pdf", None, saved, None).unwrap();
+    assert!(s.get(id).unwrap().info.encrypted);
+    let opts = SignOptions { page: 0, rect: Some([20.0, 20.0, 180.0, 60.0]), ..SignOptions::default() };
+    let signed = s.sign(id, &digital_id, opts).unwrap();
+    s.set_trusted_certificates(vec![digital_id.certificate.clone()]);
+    s.mark_signed(id, signed.clone(), None).unwrap();
+    let sig = &s.get(id).unwrap().signatures[0];
+    assert_eq!((sig.status, sig.modification.clone()), (SignatureStatus::Valid, sign::Modification::None));
+    // The file still opens without a password and is still encrypted.
+    let again = s.open("signed.pdf", None, signed, None).unwrap();
+    let d = s.get(again).unwrap();
+    assert!(d.info.encrypted);
+    assert_eq!(d.signatures[0].status, SignatureStatus::Valid);
+}
+
+/// Signing an XFA form runs its preSign scripts into what is signed; filling it in afterwards
+/// (the next person's blocks) is a permitted change, and the layout stays as signed.
+#[test]
+fn signing_an_xfa_form_then_filling_it_in() {
+    let template = r##"<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form1" layout="tb">
+      <pageSet><pageArea name="P"><contentArea x="0.5in" y="0.5in" w="7.5in" h="10in"/><medium stock="letter"/></pageArea></pageSet>
+      <subform name="S" w="7.5in" h="4in">
+        <field name="Name" x="0" y="0" w="3in" h="0.3in"><ui><textEdit/></ui></field>
+        <field name="Sig" x="0" y="0.5in" w="3in" h="0.6in"><ui><signature/></ui>
+          <event activity="preSign"><script contentType="application/x-javascript">Stamp.rawValue = "signed"; Stamp.access = "readOnly";</script></event></field>
+        <field name="Stamp" x="3.5in" y="0.5in" w="2in" h="0.3in"><ui><textEdit/></ui></field>
+        <field name="Approve" x="0" y="1.5in" w="0.2in" h="0.2in"><ui><checkButton/></ui><items><integer>1</integer><integer>0</integer></items></field>
+      </subform></subform></template>"##;
+    let p12 = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../sign/tests/data/ec-p256.p12")).unwrap();
+    let digital_id = sign::pkcs12::open(&p12, "test").unwrap();
+    let mut s = Session::new().with_clock(|| 1_800_000_000);
+    let id = s.open("form.pdf", None, Arc::new(xfa_fixture_with(template, "")), None).unwrap();
+    s.apply(id, Edit::SetFieldValue { name: "form1[0].S[0].Name[0]".into(), value: FieldValue::Text("Ann".into()) }).unwrap();
+    let signed = s.sign(id, &digital_id, SignOptions { field: Some("form1[0].S[0].Sig[0]".into()), ..SignOptions::default() }).unwrap();
+    s.set_trusted_certificates(vec![digital_id.certificate.clone()]);
+    let id = s.open("signed.pdf", None, signed, None).unwrap();
+    let value = |s: &Session, n: &str| s.get(id).unwrap().form.iter().find(|f| f.name == n).map(|f| (f.value.clone(), f.read_only()));
+    assert_eq!(value(&s, "form1[0].S[0].Stamp[0]"), Some((vec!["signed".to_string()], true)), "preSign ran before signing");
+    assert_eq!(value(&s, "form1[0].S[0].Name[0]").map(|v| v.0), Some(vec!["Ann".to_string()]));
+    assert_eq!(s.get(id).unwrap().signatures.iter().find(|g| g.signed).map(|g| g.status), Some(SignatureStatus::Valid));
+    // The next person fills in their block: still valid, the change is form fill.
+    s.apply(id, Edit::SetFieldValue { name: "form1[0].S[0].Approve[0]".into(), value: FieldValue::Check(true) }).unwrap();
+    let saved = s.save_bytes(id).unwrap();
+    let again = s.open("approved.pdf", None, saved, None).unwrap();
+    let sig = s.get(again).unwrap().signatures.iter().find(|g| g.signed).cloned().unwrap();
+    assert_eq!(sig.status, SignatureStatus::Valid, "{:?}", sig.modification);
+    assert!(matches!(&sig.modification, sign::Modification::Allowed(k) if k.iter().any(|k| k == "form fill")), "{:?}", sig.modification);
 }

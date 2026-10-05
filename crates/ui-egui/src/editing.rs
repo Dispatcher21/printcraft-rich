@@ -66,6 +66,12 @@ impl PrintCraftApp {
                 self.handle_js(id, out);
                 true
             }
+            // An XFA script shows a pop-up menu: show it where the pointer is.
+            Err(printcraft_engine::EditError::XfaChoice { field, items, answers }) => {
+                let at = self.ctx.as_ref().and_then(|c| c.input(|i| i.pointer.latest_pos()));
+                self.xfa_menu = Some(crate::forms_ui::XfaMenu { field, items, answers, at });
+                false
+            }
             Err(e) if plain_error => {
                 self.notify(e.to_string());
                 false

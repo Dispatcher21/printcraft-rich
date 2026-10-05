@@ -145,7 +145,7 @@ impl Canvas {
             return;
         }
         let avail = (w - para.left - para.right).max(1.0);
-        let lines: Vec<String> = if wrap { template::wrap(text, font, avail) } else { text.lines().map(str::to_string).collect() };
+        let lines: Vec<String> = if wrap { template::wrap(text, font, avail) } else { template::breaks(text).lines().map(str::to_string).collect() };
         let lh = if para.line_height > 0.0 { para.line_height } else { font.size * 1.15 };
         let total = lines.len() as f64 * lh;
         let top = match para.v {
@@ -156,10 +156,14 @@ impl Canvas {
         let (res, base) = std_font(font);
         self.fonts.insert(res, base);
         self.out.push_str(&format!("BT /{res} {} Tf {} rg\n", n(font.size), rgb(font.color)));
+        if (font.hscale - 1.0).abs() > 1e-3 {
+            self.out.push_str(&format!("{} Tz\n", n(font.hscale.clamp(0.1, 4.0) * 100.0)));
+        }
         for (i, line) in lines.iter().enumerate().take(5_000) {
             let tw = template::text_width(line, font);
             let lx = match para.h {
-                HAlign::Left => x + para.left + if i == 0 { para.indent } else { 0.0 },
+                // A hanging first line (negative indent) stays inside the box.
+                HAlign::Left => (x + para.left + if i == 0 { para.indent } else { 0.0 }).max(x),
                 HAlign::Center => x + para.left + (avail - tw) / 2.0,
                 HAlign::Right => x + w - para.right - tw,
             };
@@ -802,7 +806,9 @@ impl Ctx<'_> {
                 c.border(content[0], content[1], content[2], content[3], &b);
                 let mut d = self.widget(doc, page, Self::to_pdf_rect(c, content));
                 d.set(b"FT".to_vec(), Object::name("Sig"));
-                self.finish_terminal(doc, page, d, 0, &da, 0, tooltip.as_deref(), &inst.som);
+                // A protected signature field (a form locks it until the blocks above are
+                // filled) can't be signed yet.
+                self.finish_terminal(doc, page, d, ff & flags::READ_ONLY, &da, 0, tooltip.as_deref(), &inst.som);
                 self.acro.redraw.push(inst.som.clone());
             }
             Ui::Static => {

@@ -262,3 +262,100 @@ Str(sq(3) + Mod(10, 4) + Abs(-1.5), 6, 1)</script></calculate></field>
     assert_eq!(v("R6"), "yes");
     assert_eq!(v("R7"), "visible");
 }
+
+/// Patterns from a real leave form (all synthetic here): check boxes sharing one data value,
+/// unbound fields, pop-up pick lists, keystroke filters, `execEvent("calculate")`, a text
+/// variable, Acrobat's `event.target.getField(…).signatureValidate()` and `util.printd`.
+const LEAVE: &str = r##"<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/">
+<subform name="form1" layout="tb" restoreState="auto">
+  <variables><text name="remLeave">Leave remark</text>
+    <script name="fn" contentType="application/x-javascript">function unlock(a, b, sig) { sig.access = (a.rawValue != null &amp;&amp; b.rawValue == 2) ? "open" : "protected"; }</script>
+  </variables>
+  <pageSet><pageArea name="P"><contentArea x="0.25in" y="0.25in" w="8in" h="10in"/><medium short="8.5in" long="11in"/></pageArea></pageSet>
+  <subform name="Page1" w="8in" h="6in">
+    <field name="NAME" x="0" y="0" w="3in" h="0.3in"><ui><textEdit/></ui><bind match="none"/>
+      <event activity="exit"><script contentType="application/x-javascript">fn.unlock(NAME, ORDINARY, SIG);</script></event></field>
+    <field name="SSN" x="3.5in" y="0" w="2in" h="0.3in"><ui><textEdit/></ui><bind match="none"/>
+      <event activity="change"><script contentType="application/x-javascript">var s = String(xfa.event.change), o = ""; for (var i = 0; i &lt; s.length; i++) { if ("0123456789".indexOf(s.charAt(i)) != -1) o += s.charAt(i); } xfa.event.change = o;</script></event></field>
+    <field name="RANK" x="0" y="0.5in" w="2in" h="0.3in"><ui><textEdit/></ui><bind match="none"/>
+      <event activity="click"><script contentType="application/x-javascript">this.rawValue = app.popUpMenuEx({cName:"Sergeant",cReturn:"SGT"},{cName:"More",oSubMenu:[{cName:"Captain",cReturn:"CPT"}]});</script></event></field>
+    <field name="ORDINARY" x="0" y="1in" w="0.2in" h="0.2in"><ui><checkButton/></ui><value><text>0</text></value><items><text>2</text><text>0</text></items><bind match="dataRef" ref="$.group1"/>
+      <event activity="click"><script contentType="application/x-javascript">if (this.rawValue == 2) { REMARKS.rawValue = remLeave.value; } fn.unlock(NAME, ORDINARY, SIG);</script></event></field>
+    <field name="TDY" x="1in" y="1in" w="0.2in" h="0.2in"><ui><checkButton/></ui><value><text>0</text></value><items><text>4</text><text>0</text></items><bind match="dataRef" ref="$.group1"/></field>
+    <field name="REMARKS" x="0" y="1.5in" w="6in" h="0.3in"><ui><textEdit/></ui><bind match="none"/></field>
+    <field name="DAYS" x="0" y="2in" w="1in" h="0.3in"><ui><numericEdit/></ui><bind match="none"/>
+      <event activity="exit"><script contentType="application/x-javascript">TO.execEvent("calculate");</script></event></field>
+    <field name="TO" x="2in" y="2in" w="1in" h="0.3in" access="readOnly"><ui><textEdit/></ui><bind match="none"/>
+      <calculate override="disabled"><script contentType="application/x-javascript">DAYS.rawValue == null ? null : "in " + DAYS.rawValue + " days"</script></calculate></field>
+    <field name="SIG" x="0" y="3in" w="3in" h="0.5in" access="protected"><ui><signature/></ui>
+      <event activity="preSign"><script contentType="application/x-javascript">STAMP.rawValue = util.printd("yyyymmdd", new Date(2026, 9, 5)); STAMP.access = "readOnly";</script></event></field>
+    <field name="STAMP" x="3.5in" y="3in" w="2in" h="0.3in"><ui><textEdit/></ui><bind match="none"/></field>
+    <field name="STATE" x="0" y="4in" w="2in" h="0.3in"><ui><textEdit/></ui><bind match="none"/>
+      <event activity="initialize"><script contentType="application/x-javascript">this.rawValue = String(event.target.getField("form1[0].Page1[0].SIG[0]").signatureValidate());</script></event></field>
+  </subform>
+</subform>
+</template>"##;
+
+const LEAVE_DATA: &str = r#"<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form1><Page1><group1>4</group1></Page1></form1></xfa:data></xfa:datasets>"#;
+
+fn fill(doc: &mut Document, name: &str, v: FieldValue) -> Outcome {
+    let full = format!("form1[0].Page1[0].{name}[0]");
+    assert!(printcraft_forms::set_value(doc, &full, &v).is_ok(), "{full}");
+    match after_edit(doc, &[full], &OPTS) {
+        Ok(o) => o,
+        Err(e) => panic!("{name}: {e}"),
+    }
+}
+
+fn get(doc: &Document, name: &str) -> Option<String> {
+    value(doc, &format!("form1[0].Page1[0].{name}[0]"))
+}
+
+fn read_only(doc: &Document, name: &str) -> bool {
+    fields(doc).into_iter().find(|f| f.name == format!("form1[0].Page1[0].{name}[0]")).is_some_and(|f| f.read_only())
+}
+
+#[test]
+fn leave_form_patterns() {
+    let mut doc = open_doc(xfa_pdf(LEAVE, LEAVE_DATA));
+    let r = realize_with(&mut doc, &OPTS);
+    assert!(r.as_ref().is_ok_and(|r| r.output.errors.is_empty()), "{r:?}");
+    assert_eq!(get(&doc, "STATE").as_deref(), Some("0"), "unsigned");
+    assert!(read_only(&doc, "SIG"), "protected until filled");
+    // The data says TDY (4); checking ORDINARY moves the shared value to 2.
+    assert_eq!(get(&doc, "TDY").as_deref(), Some("4"));
+    fill(&mut doc, "NAME", FieldValue::Text("DOE, JOHN".into()));
+    let o = fill(&mut doc, "ORDINARY", FieldValue::Check(true));
+    assert!(o.output.errors.is_empty(), "{o:?}");
+    assert_eq!(get(&doc, "TDY").as_deref(), Some(""), "unchecked");
+    assert_eq!(get(&doc, "REMARKS").as_deref(), Some("Leave remark"));
+    assert!(!read_only(&doc, "SIG"), "unlocked once filled");
+    // Keystroke filter: only digits stay.
+    fill(&mut doc, "SSN", FieldValue::Text("123-45-6789".into()));
+    assert_eq!(get(&doc, "SSN").as_deref(), Some("123456789"));
+    // execEvent("calculate") from another field's exit.
+    fill(&mut doc, "DAYS", FieldValue::Text("15".into()));
+    assert_eq!(get(&doc, "TO").as_deref(), Some("in 15 days"));
+    // A pick list asks, then fills (submenus flatten to "More > Captain").
+    let rank = "form1[0].Page1[0].RANK[0]";
+    let ask = click(&mut doc, rank, &OPTS);
+    let items = ask.as_ref().ok().and_then(|o| o.output.ask.clone()).unwrap_or_default();
+    assert_eq!(items, vec![("Sergeant".to_string(), "SGT".to_string()), ("More > Captain".to_string(), "CPT".to_string())]);
+    assert_eq!(get(&doc, "RANK").as_deref(), Some(""), "nothing changes until answered");
+    assert!(click_answering(&mut doc, rank, &[Some("CPT".into())], &OPTS).is_ok());
+    assert_eq!(get(&doc, "RANK").as_deref(), Some("CPT"));
+    // preSign stamps the date and locks it.
+    assert!(before_sign(&mut doc, "form1[0].Page1[0].SIG[0]", &OPTS).is_ok());
+    assert_eq!(get(&doc, "STAMP").as_deref(), Some("20261005"));
+    assert!(read_only(&doc, "STAMP"));
+    // Unbound values (NAME, SSN, RANK, …) survive saving and reopening: they're kept in the
+    // form state packet.
+    let mut again = reopen_doc(&doc);
+    assert!(realize_with(&mut again, &OPTS).is_ok());
+    for (f, v) in [("NAME", "DOE, JOHN"), ("SSN", "123456789"), ("RANK", "CPT"), ("REMARKS", "Leave remark"), ("STAMP", "20261005")] {
+        assert_eq!(get(&again, f).as_deref(), Some(v), "{f}");
+    }
+    let live = dom::Live::load(&again).ok();
+    let form = live.as_ref().and_then(|l| l.xdp.form.map(|f| l.tree().to_string_of(f))).unwrap_or_default();
+    assert!(form.contains(r#"<field name="NAME"><value override="1"><text>DOE, JOHN</text></value></field>"#), "{form}");
+}

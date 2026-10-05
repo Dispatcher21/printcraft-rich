@@ -219,6 +219,8 @@ pub struct Document {
     js_output: js::JsOutput,
     /// The document's XFA form, if it has one.
     pub xfa: Option<XfaState>,
+    /// XFA fields with click scripts (clicking them runs [`Edit::PressXfaButton`]).
+    pub xfa_clickable: Arc<Vec<String>>,
 }
 
 /// How an XFA form was handled on open.
@@ -263,6 +265,12 @@ fn realize_xfa(cos: &printcraft_cos::Document, password: Option<&str>, opts: &pr
             Ok(Err(_)) | Err(_) => (state, None),
         });
     }
+    // A signed form that was laid out before keeps its pages: laying it out again would show
+    // as a change after signing.
+    let laid_out = printcraft_forms::fields(cos).iter().any(|f| f.kind != printcraft_forms::FieldKind::PushButton);
+    if laid_out && printcraft_xfa::is_signed(cos) {
+        return Some((XfaState { dynamic: true, report: None, error: None, output: Default::default() }, None));
+    }
     let attempt = guard(|| -> Result<_, String> {
         let mut doc = cos.clone();
         let report = printcraft_xfa::realize_with(&mut doc, opts).map_err(|e| e.to_string())?;
@@ -280,7 +288,7 @@ fn realize_xfa(cos: &printcraft_cos::Document, password: Option<&str>, opts: &pr
 /// After an edit of an XFA form: the filled fields' events and the calculations, or a button's
 /// click scripts. Returns what the scripts did (`None`: nothing to run).
 fn xfa_after(doc: &mut printcraft_cos::Document, edit: &Edit, opts: &printcraft_xfa::Options) -> Result<Option<printcraft_xfa::Outcome>, EditError> {
-    if let Edit::PressXfaButton { name } = edit {
+    if let Edit::PressXfaButton { name, answers } = edit {
         if !opts.scripts {
             return Err(EditError::Invalid("JavaScript is turned off (Preferences ▸ JavaScript), so the form's buttons don't run".into()));
         }
@@ -288,9 +296,12 @@ fn xfa_after(doc: &mut printcraft_cos::Document, edit: &Edit, opts: &printcraft_
             return Err(EditError::Invalid(format!("{} has no action", xfa_short_name(name))));
         }
         let mut trial = doc.clone();
-        let o = guard(|| printcraft_xfa::click(&mut trial, name, opts))
+        let o = guard(|| printcraft_xfa::click_answering(&mut trial, name, answers, opts))
             .map_err(|m| EditError::Invalid(format!("pressing {} failed unexpectedly ({m})", xfa_short_name(name))))?
             .map_err(|e| EditError::Invalid(e.to_string()))?;
+        if let Some(items) = o.output.ask.clone() {
+            return Err(EditError::XfaChoice { field: name.clone(), items, answers: answers.clone() });
+        }
         *doc = trial;
         return Ok(Some(o));
     }
@@ -964,10 +975,13 @@ pub enum Edit {
     ApplyScriptChanges {
         changes: Vec<printcraft_forms::FieldChange>,
     },
-    /// Press a button of an XFA form: its `click` scripts run (add or remove a row, show a
-    /// section, …), then the calculations.
+    /// Click a field or button of an XFA form: its `click` scripts run (add or remove a row,
+    /// show a section, pick from a pop-up menu, …), then the calculations. `answers` answer
+    /// the pop-up menus the scripts show, in order (`None`: dismissed); when one is missing the
+    /// edit fails with [`EditError::XfaChoice`] listing the choices.
     PressXfaButton {
         name: String,
+        answers: Vec<Option<String>>,
     },
     /// Scan & OCR ▸ Recognize text: put recognised words on `page` as invisible text over the
     /// image (from [`ocr::OcrJob::run`]).
@@ -1165,7 +1179,7 @@ impl Edit {
             Edit::MarkDecorative { .. } => "Mark figure as decorative".into(),
             Edit::AddOcrText { .. } => "Recognize text".into(),
             Edit::ApplyScriptChanges { .. } => "Run JavaScript".into(),
-            Edit::PressXfaButton { name } => format!("Press {}", xfa_short_name(name)),
+            Edit::PressXfaButton { name, .. } => format!("Press {}", xfa_short_name(name)),
             Edit::ConvertPdfA { level } => format!("Save as {}", level.label()),
             Edit::SetFieldScript { name, .. } => format!("Edit script of {name}"),
             Edit::SetDocumentScript { script: None, .. } => "Delete document JavaScript".into(),
@@ -1772,6 +1786,10 @@ fn plural(s: &str, n: usize) -> String {
 pub enum EditError {
     #[error("no such document")]
     NoDocument,
+    /// An XFA form's script shows a pop-up menu: pick one of `items` (label, value), then apply
+    /// the edit again with the value appended to `answers`.
+    #[error("{} asks to choose one of: {}", xfa_short_name(field), items.iter().map(|(l, _)| l.trim()).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(", "))]
+    XfaChoice { field: String, items: Vec<(String, String)>, answers: Vec<Option<String>> },
     #[error("this document can't be edited: {0}")]
     ReadOnly(String),
     #[error("the document's security settings don't allow {0}; open it with the owner password to make this change")]
@@ -1977,8 +1995,15 @@ impl Session {
             editor,
             config,
             js_output: xfa.as_ref().map(|x| xfa_js_output(x.output.clone())).unwrap_or_default(),
+            xfa_clickable: Arc::default(),
             xfa,
         });
+        if let Some(d) = self.docs.last_mut()
+            && d.xfa.is_some()
+            && let Some(e) = d.editor.as_ref()
+        {
+            d.xfa_clickable = Arc::new(printcraft_xfa::clickable(&e.cos));
+        }
         Ok(id)
     }
 
@@ -2164,6 +2189,9 @@ impl Session {
         doc.added = printcraft_edit::list_added(&editor.cos);
         doc.links = printcraft_annot::links::list(&editor.cos);
         doc.signatures = signatures_of(&editor.cos, &bytes, &doc.trust, &doc.sig_cache);
+        if doc.xfa.is_some() {
+            doc.xfa_clickable = Arc::new(printcraft_xfa::clickable(&editor.cos));
+        }
         doc.bytes = bytes.clone();
         doc.renderer = RenderPool::new(bytes, render_threads(), doc.config.clone());
         Ok(())
@@ -2573,6 +2601,16 @@ impl Session {
         let editor = d.editor.as_ref().ok_or_else(|| EditError::ReadOnly(d.read_only_reason.clone().unwrap_or_default()))?;
         if opts.date.is_empty() {
             opts.date = self.signing_date();
+        }
+        // XFA forms: the field's preSign scripts (stamp the date, lock fields) go into what is
+        // signed. A failing script doesn't stop the signature.
+        if d.xfa.is_some()
+            && let Some(field) = opts.field.clone()
+        {
+            let mut cos = editor.cos.clone();
+            if let Ok(Ok(_)) = guard(|| printcraft_xfa::before_sign(&mut cos, &field, &self.xfa_options())) {
+                return Ok(Arc::new(printcraft_sign::sign(&cos, id, &opts)?));
+            }
         }
         Ok(Arc::new(printcraft_sign::sign(&editor.cos, id, &opts)?))
     }

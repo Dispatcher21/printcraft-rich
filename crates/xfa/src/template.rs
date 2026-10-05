@@ -179,13 +179,15 @@ pub struct Font {
     pub italic: bool,
     pub color: [f64; 3],
     pub underline: bool,
+    /// Horizontal scale (`fontHorizontalScale`, 1.0 = normal width).
+    pub hscale: f64,
 }
 
 impl Default for Font {
     fn default() -> Self {
         // XFA's default font: 10pt Courier is the spec default, but designers always set one;
         // a sans face reads closer to what forms intend when it's missing.
-        Font { family: Family::Sans, size: 10.0, bold: false, italic: false, color: [0.0; 3], underline: false }
+        Font { family: Family::Sans, size: 10.0, bold: false, italic: false, color: [0.0; 3], underline: false, hscale: 1.0 }
     }
 }
 
@@ -229,21 +231,38 @@ pub fn font(tree: &Tree, n: NodeId, base: &Font) -> Font {
     if let Some(c) = color_of(tree, tree.child(el, "fill")) {
         f.color = c;
     }
+    if let Some(h) = tree.attr(el, "fontHorizontalScale").and_then(percent) {
+        f.hscale = h;
+    }
     f
+}
+
+/// `"83%"` → 0.83 (kept within 10%–400%).
+fn percent(v: &str) -> Option<f64> {
+    let x = v.trim().trim_end_matches('%').trim().parse::<f64>().ok()?;
+    (x.is_finite() && x > 0.0).then(|| (x / 100.0).clamp(0.1, 4.0))
 }
 
 /// Approximate advance of `s` in `font`.
 pub fn text_width(s: &str, font: &Font) -> f64 {
-    match font.family {
-        Family::Mono => s.chars().count() as f64 * 0.6 * font.size,
-        Family::Serif => printcraft_fonts::helvetica_width(s, font.size) * if font.bold { 0.97 } else { 0.92 },
-        Family::Sans => printcraft_fonts::helvetica_width(s, font.size) * if font.bold { 1.06 } else { 1.0 },
-    }
+    font.hscale.clamp(0.1, 4.0)
+        * match font.family {
+            Family::Mono => s.chars().count() as f64 * 0.6 * font.size,
+            Family::Serif => printcraft_fonts::helvetica_width(s, font.size) * if font.bold { 0.97 } else { 0.92 },
+            Family::Sans => printcraft_fonts::helvetica_width(s, font.size) * if font.bold { 1.06 } else { 1.0 },
+        }
 }
 
 /// Greedy line breaking for `font` within `width`.
+/// Line breaks as `\n`: forms also break lines with a bare carriage return (`&#13;`) and
+/// the Unicode line and paragraph separators.
+pub fn breaks(text: &str) -> String {
+    text.replace("\r\n", "\n").replace(['\r', '\u{2028}', '\u{2029}'], "\n")
+}
+
 pub fn wrap(text: &str, font: &Font, width: f64) -> Vec<String> {
     let mut lines = Vec::new();
+    let text = breaks(text);
     for para in text.split('\n') {
         let para = para.trim_end_matches('\r');
         let mut line = String::new();
@@ -464,11 +483,12 @@ pub fn rich_text(tree: &Tree, n: NodeId) -> String {
     out.lines().map(str::trim_end).collect::<Vec<_>>().join("\n").trim_matches('\n').to_string()
 }
 
-/// The first font size and weight set in rich text (spans' inline styles), if any.
+/// The style of rich text drawn in one font: the first size set, and the weight and
+/// horizontal scale that cover most of the text (a bold lead-in like "Note:" doesn't make
+/// the whole paragraph bold).
 pub fn rich_style(tree: &Tree, n: NodeId, base: &Font) -> Font {
     let mut f = base.clone();
     let mut set_size = false;
-    let mut set_bold = false;
     for d in tree.descendants(n) {
         let Some(style) = tree.attr(d, "style") else { continue };
         for decl in style.split(';') {
@@ -480,10 +500,6 @@ pub fn rich_style(tree: &Tree, n: NodeId, base: &Font) -> Font {
                         f.size = s;
                         set_size = true;
                     }
-                }
-                "font-weight" if !set_bold => {
-                    f.bold = v == "bold" || v.parse::<u32>().is_ok_and(|w| w >= 600);
-                    set_bold = true;
                 }
                 "font-family" => f.family = family_of(v),
                 "font-style" => f.italic = v == "italic",
@@ -498,10 +514,53 @@ pub fn rich_style(tree: &Tree, n: NodeId, base: &Font) -> Font {
                 _ => {}
             }
         }
-        if (tree.tag(d) == "b" || tree.tag(d) == "strong") && !set_bold {
-            f.bold = true;
-            set_bold = true;
+    }
+    // Weight and scale by how much text each covers (styles inherit down the tree).
+    let (mut bold_chars, mut plain_chars) = (0usize, 0usize);
+    let mut scales: Vec<(f64, usize)> = Vec::new();
+    let mut stack: Vec<(NodeId, bool, f64, usize)> = vec![(n, base.bold, base.hscale, 0)];
+    while let Some((at, bold, hs, depth)) = stack.pop() {
+        if depth > 64 {
+            continue;
         }
+        let (mut bold, mut hs) = (bold, hs);
+        if matches!(tree.tag(at), "b" | "strong") {
+            bold = true;
+        }
+        if let Some(style) = tree.attr(at, "style") {
+            for decl in style.split(';') {
+                let Some((k, v)) = decl.split_once(':') else { continue };
+                match k.trim() {
+                    "font-weight" => bold = v.trim() == "bold" || v.trim().parse::<u32>().is_ok_and(|w| w >= 600),
+                    "xfa-font-horizontal-scale" => hs = percent(v).unwrap_or(hs),
+                    _ => {}
+                }
+            }
+        }
+        for c in tree.children(at) {
+            match tree.node(*c).map(|x| &x.kind) {
+                Some(crate::xml::Kind::Text(t)) | Some(crate::xml::Kind::CData(t)) => {
+                    let k = t.chars().filter(|ch| !ch.is_whitespace()).count();
+                    if bold {
+                        bold_chars += k
+                    } else {
+                        plain_chars += k
+                    }
+                    match scales.iter_mut().find(|(s, _)| (*s - hs).abs() < 1e-6) {
+                        Some(e) => e.1 += k,
+                        None => scales.push((hs, k)),
+                    }
+                }
+                Some(crate::xml::Kind::Element { .. }) => stack.push((*c, bold, hs, depth + 1)),
+                _ => {}
+            }
+        }
+    }
+    if bold_chars + plain_chars > 0 {
+        f.bold = bold_chars > plain_chars;
+    }
+    if let Some((s, _)) = scales.iter().max_by_key(|(_, k)| *k) {
+        f.hscale = *s;
     }
     f
 }
@@ -549,6 +608,19 @@ mod tests {
             .unwrap_or_default();
         let e = t.child(Tree::ROOT, "exData").unwrap_or(0);
         assert_eq!(rich_text(&t, e), "Line one\ntwo\nthree");
-        assert!(rich_style(&t, e, &Font::default()).bold);
+        // One bold word doesn't make the paragraph bold; mostly bold text is.
+        assert!(!rich_style(&t, e, &Font::default()).bold);
+        let t = Tree::parse(r#"<exData><body><p style="font-weight:bold;xfa-font-horizontal-scale:80%">Mostly bold <span style="font-weight:normal">x</span></p></body></exData>"#)
+            .unwrap_or_default();
+        let e = t.child(Tree::ROOT, "exData").unwrap_or(0);
+        let f = rich_style(&t, e, &Font::default());
+        assert!(f.bold);
+        assert!((f.hscale - 0.8).abs() < 1e-9);
+        assert!(text_width("abc", &f) < text_width("abc", &Font { bold: true, ..Font::default() }));
+    }
+
+    #[test]
+    fn carriage_returns_break_lines() {
+        assert_eq!(wrap("a\rb\r\nc", &Font::default(), 500.0), vec!["a", "b", "c"]);
     }
 }

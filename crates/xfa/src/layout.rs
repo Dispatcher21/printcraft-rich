@@ -145,9 +145,12 @@ pub fn caption(t: &Tree, field: NodeId) -> Option<Caption> {
         None if text.is_empty() => 0.0,
         None => match place {
             Place::Left | Place::Right => {
-                text.lines().map(|l| template::text_width(l, &font)).fold(0.0, f64::max) + font.size * 0.5 + margin.left + margin.right
+                template::breaks(&text).lines().map(|l| template::text_width(l, &font)).fold(0.0, f64::max)
+                    + font.size * 0.5
+                    + margin.left
+                    + margin.right
             }
-            Place::Top | Place::Bottom => text.lines().count().max(1) as f64 * font.size * 1.2 + margin.top + margin.bottom,
+            Place::Top | Place::Bottom => template::breaks(&text).lines().count().max(1) as f64 * font.size * 1.2 + margin.top + margin.bottom,
             Place::Inline => 0.0,
         },
     };
@@ -164,8 +167,15 @@ impl Sizer<'_> {
         let Some(inst) = self.form.get(i) else { return 0.0 };
         let n = inst.t;
         let m = template::margin(self.t, n);
-        let font = value_font(self.t, n);
-        let line = font.size * 1.2;
+        // Measure with the font and line spacing drawing uses (rich text's own style, the
+        // para's lineHeight).
+        let rich = self.t.child(n, "value").and_then(|v| self.t.child(v, "exData"));
+        let font = match rich {
+            Some(x) if inst.tag == Tag::Draw => template::rich_style(self.t, x, &value_font(self.t, n)),
+            _ => value_font(self.t, n),
+        };
+        let para = template::para(self.t, n);
+        let line = if para.line_height > 0.0 { para.line_height } else { font.size * 1.2 };
         let mut h = m.top + m.bottom;
         let cap = if inst.tag == Tag::Field { caption(self.t, n) } else { None };
         let cap_w = cap.as_ref().filter(|c| matches!(c.place, Place::Left | Place::Right)).map_or(0.0, |c| c.reserve);
@@ -173,7 +183,7 @@ impl Sizer<'_> {
             Tag::Draw => self.t.child(n, "value").and_then(|v| template::value_text(self.t, v)).unwrap_or_default(),
             _ => inst.value.clone(),
         };
-        let avail = (w - m.left - m.right - cap_w).max(1.0);
+        let avail = (w - m.left - m.right - cap_w - para.left - para.right).max(1.0);
         let lines = if text.is_empty() { 1 } else { template::wrap(&text, &font, avail).len().max(1) };
         h += lines as f64 * line;
         if let Some(c) = cap.filter(|c| matches!(c.place, Place::Top | Place::Bottom)) {
@@ -191,7 +201,7 @@ impl Sizer<'_> {
             Tag::Draw => self.t.child(n, "value").and_then(|v| template::value_text(self.t, v)).unwrap_or_default(),
             _ => inst.value.clone(),
         };
-        let tw = text.lines().map(|l| template::text_width(l, &font)).fold(0.0, f64::max);
+        let tw = template::breaks(&text).lines().map(|l| template::text_width(l, &font)).fold(0.0, f64::max);
         let cap = caption(self.t, n).filter(|c| matches!(c.place, Place::Left | Place::Right)).map_or(0.0, |c| c.reserve);
         tw + m.left + m.right + cap + 2.0
     }

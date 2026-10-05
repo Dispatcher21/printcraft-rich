@@ -467,6 +467,15 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>) -> Mod
             }
         })
         .collect();
+    // XFA forms keep their data in streams of the AcroForm's /XFA array: changing them is
+    // filling in the form.
+    let xfa_streams: HashSet<ObjRef> = acroform(doc)
+        .and_then(|af| af.get(b"XFA").cloned())
+        .map(|x| match &*doc.resolve(&x) {
+            Object::Array(a) => a.iter().filter_map(Object::as_ref).collect(),
+            _ => x.as_ref().into_iter().collect(),
+        })
+        .unwrap_or_default();
     let (mut allowed, mut disallowed): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
     // Stored at the same place in both (and not edited since): the same bytes, unchanged.
     let same_place = |num: u32| -> bool {
@@ -497,6 +506,8 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>) -> Mod
             Object::Stream(s) => {
                 if old_content.contains(&r) {
                     "page content"
+                } else if xfa_streams.contains(&r) {
+                    "form fill"
                 } else if s.dict.name(b"Type") == Some(b"XRef") || s.dict.name(b"Type") == Some(b"ObjStm") || before.is_none() {
                     continue;
                 } else {
@@ -683,8 +694,13 @@ const BR_MARK: [i64; 3] = [1_111_111_111, 2_222_222_222, 3_333_333_333];
 
 /// Sign `doc` with `id`; returns the signed file (an incremental update when possible).
 pub fn sign(doc: &Document, id: &DigitalId, opts: &SignOptions) -> Result<Vec<u8>, SignError> {
-    if doc.security().is_some() || doc.output_handler().is_some() {
-        return Err(SignError::Unsupported("signing encrypted documents".into()));
+    // Encrypted documents are signed like any other: the update is encrypted with the
+    // document's key, except the signature's /Contents (see printcraft-cos). Their
+    // permissions must allow filling in form fields (which includes signing) or commenting.
+    if let Some(p) = doc.permissions()
+        && !(p.fill_forms() || p.annotate())
+    {
+        return Err(SignError::Unsupported("signing this document (its security settings don't allow filling in forms or signing)".into()));
     }
     let mut doc = doc.clone();
     let root = doc.root().ok_or_else(|| SignError::Pdf("the document has no catalog".into()))?;

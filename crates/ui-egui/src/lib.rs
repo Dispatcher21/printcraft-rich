@@ -311,6 +311,8 @@ pub struct PrintCraftApp {
     pub summary_sort: printcraft_engine::SummarySort,
     /// The signing dialogs' state.
     pub sign_draft: Option<SignDraft>,
+    /// An XFA form's pop-up menu waiting for a pick.
+    pub xfa_menu: Option<forms_ui::XfaMenu>,
     /// Digital ID files the user has created or added.
     pub digital_ids: Vec<DigitalIdEntry>,
     /// Signatures panel: expanded entries (field names).
@@ -476,6 +478,7 @@ impl PrintCraftApp {
             rotate_draft: RotateDraft::default(),
             summary_sort: Default::default(),
             sign_draft: None,
+            xfa_menu: None,
             digital_ids: Vec::new(),
             sig_expanded: Vec::new(),
             a11y_options: a11y_ui::A11yOptions::default(),
@@ -1189,6 +1192,7 @@ impl eframe::App for PrintCraftApp {
             Some(i) => canvas::document_area(self, i, ui),
         });
         self.process_pending_edits();
+        self.show_xfa_menu(&ctx);
         palette::show(self, &ctx);
         dialogs::show(self, &ctx);
         widgets::toast(self, &ctx);

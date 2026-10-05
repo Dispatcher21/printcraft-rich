@@ -263,6 +263,17 @@ impl Automation {
         let edit = if edits.len() == 1 { edits.remove(0) } else { Edit::Batch { label: "Fill in form".into(), edits } };
         let mut out = self.apply(a, edit)?;
         out["filled"] = json!(values.len());
+        // What the form's scripts said (XFA messages, validation failures, script errors).
+        let id = self.doc(a)?.id;
+        let js = self.session.take_js_output(id);
+        if let Some(o) = out.as_object_mut() {
+            if !js.alerts.is_empty() {
+                o.insert("messages".into(), json!(js.alerts));
+            }
+            if !js.errors.is_empty() {
+                o.insert("script_errors".into(), json!(js.errors));
+            }
+        }
         Ok(out)
     }
 
@@ -277,7 +288,20 @@ impl Automation {
         if !self.doc(a)?.form.iter().any(|f| f.name == name) {
             return Err(failed(format!("no field named {name:?} (form_fields lists them)")));
         }
-        self.session.apply(id, Edit::PressXfaButton { name }).map_err(failed)?;
+        let answers: Vec<Option<String>> = match a.get("answers") {
+            Some(_) => a.strs("answers")?.into_iter().map(|s| Some(s.to_owned())).collect(),
+            None => Vec::new(),
+        };
+        match self.session.apply(id, Edit::PressXfaButton { name, answers }) {
+            // A pop-up menu: tell the agent the choices instead of failing.
+            Err(printcraft_engine::EditError::XfaChoice { items, answers, .. }) => {
+                let choices: Vec<Value> = items.iter().map(|(label, value)| json!({ "label": label, "value": value })).collect();
+                return Ok(
+                    json!({ "needs_choice": choices, "answers_so_far": answers, "hint": "call again with answers: the answers so far plus the value you pick" }),
+                );
+            }
+            r => r.map_err(failed)?,
+        }
         let out = self.session.take_js_output(id);
         let mut v = summary(self.doc(a)?);
         if let Some(o) = v.as_object_mut() {

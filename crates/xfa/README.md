@@ -58,6 +58,16 @@ boa engine of `printcraft-js`, FormCalc on this crate's interpreter) against a l
 visibility, properties and instances lay the pages out again. Property changes are saved in
 the catalog's `/PieceInfo /PrintCraft` so they survive reopening; row counts live in the data.
 
+Scripts also get the Acrobat objects LiveCycle forms use: `event.target` (the document) with
+`getField(…).signatureValidate()`, `app.alert`, `app.popUpMenuEx` (a pick list: the job stops
+and reports the choices in `Output::ask`; `click_answering` finishes it), and `util.printd`.
+`before_sign` runs a signature field's `preSign` scripts.
+
+Fields that don't bind to data (`<bind match="none"/>`) keep their values in the `form`
+packet, where Acrobat keeps them; PrintCraft reads and writes it (Acrobat's checksum is left as
+it was). Once a form carries a signature its pages stay as signed: scripts still update values
+and field locks, but nothing is laid out again.
+
 ## Not supported
 
 - Splitting a text block across pages; `keep`, leaders and trailers; overflow targets.

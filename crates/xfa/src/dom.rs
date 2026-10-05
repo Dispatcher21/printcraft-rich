@@ -133,6 +133,11 @@ pub struct Live {
     pub changed: HashSet<N>,
     /// How many value writes happened (calculations stop when a pass makes none).
     pub writes: usize,
+    /// The form state packet changed (unbound fields' values).
+    form_dirty: bool,
+    /// The form is signed: its layout is fixed and PrintCraft's own state record (in the
+    /// catalog, which signatures don't let change) is left alone.
+    pub frozen: bool,
     added: usize,
 }
 
@@ -218,7 +223,7 @@ impl Live {
         xdp.tree.detach(holder);
         let order = xdp.tree.descendants(template).into_iter().enumerate().map(|(i, n)| (n, i)).collect();
         let parents = vec![index_parents(&body)];
-        Ok(Live {
+        let mut live = Live {
             xdp,
             template,
             root,
@@ -232,8 +237,12 @@ impl Live {
             layout_changed: false,
             changed: HashSet::new(),
             writes: 0,
+            form_dirty: false,
+            frozen: false,
             added: 0,
-        })
+        };
+        live.apply_form_packet();
+        Ok(live)
     }
 
     pub fn tree(&self) -> &Tree {
@@ -366,6 +375,13 @@ impl Live {
         let t = self.tree();
         let v = t.child(self.inst(n)?.t, "variables")?;
         t.elements(v).find(|s| t.tag(*s) == "script" && t.attr(*s, "name") == Some(name))
+    }
+
+    /// A named value in `<variables>` on `n` (not a script).
+    pub fn variable(&self, n: N, name: &str) -> Option<NodeId> {
+        let t = self.tree();
+        let v = t.child(self.inst(n)?.t, "variables")?;
+        t.elements(v).find(|s| t.tag(*s) != "script" && t.tag(*s) != "manifest" && t.attr(*s, "name") == Some(name))
     }
 
     /// The template node of a repeating subform named `name` under `parent` (for `_name` and
@@ -1013,15 +1029,28 @@ impl Live {
     /// differs from what the form held, with their previous value.
     pub fn read_acroform(&mut self, doc: &Document) -> Vec<(N, Option<String>)> {
         let map = self.field_map();
+        // Compare with the values before reading anything: fields sharing a data value would
+        // otherwise see each other's new value.
+        let start: HashMap<N, Option<String>> = map.values().map(|n| (*n, self.raw(*n))).collect();
         let mut out = Vec::new();
         for f in printcraft_forms::fields(doc) {
             let Some(n) = map.get(&normalize(&f.name)).copied() else { continue };
             let Some(v) = self.value_from_acro(n, &f) else { continue };
-            let before = self.raw(n);
+            let before = start.get(&n).cloned().unwrap_or_else(|| self.raw(n));
             let unchanged = match &before {
                 Some(old) => *old == v || crate::same_date(old, &v),
                 None => v.is_empty() || self.inst(n).is_some_and(|i| crate::is_off_value(self.tree(), i, &v)),
             };
+            // Check boxes sharing one data value (each with its own on-value, a common way to
+            // make them exclusive): a box that already shows what the data says is unchanged,
+            // so an unchecked one doesn't overwrite the value its checked sibling set.
+            let shown_same = f.kind == FieldKind::CheckBox
+                && self.inst(n).is_some_and(|i| {
+                    let on = merge::check_values(self.tree(), i.t).0;
+                    let acro_on = f.value.first().is_some_and(|x| !x.is_empty() && x != "Off");
+                    acro_on == (before.as_deref() == Some(on.as_str()))
+                });
+            let unchanged = unchanged || shown_same;
             if !unchanged {
                 // Keep the spelling the data already uses for dates.
                 let v = match &before {
@@ -1108,15 +1137,118 @@ impl Live {
         self.layout_changed = false;
     }
 
+    /// Fields that don't bind to data (`<bind match="none"/>`): their values live only in the
+    /// form state packet.
+    fn unbound(&self) -> Vec<N> {
+        self.walk(0)
+            .into_iter()
+            .filter(|n| {
+                self.inst(*n).is_some_and(|i| {
+                    i.tag == Tag::Field && i.data.is_none() && !i.som.is_empty() && {
+                        let t = self.tree();
+                        t.path(i.t, &["ui", "button"]).is_none() && t.path(i.t, &["ui", "signature"]).is_none()
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Take unbound fields' values and visibility from the form state packet (where Acrobat
+    /// keeps them, and PrintCraft too).
+    fn apply_form_packet(&mut self) {
+        let Some(form) = self.xdp.form else { return };
+        let index = form_index(&self.xdp.tree, form);
+        let unbound: HashSet<N> = self.unbound().into_iter().collect();
+        for n in self.walk(0) {
+            let Some(inst) = self.inst(n) else { continue };
+            let Some(node) = index.get(&normalize(&inst.som)).copied() else { continue };
+            let t = &self.xdp.tree;
+            let value = (unbound.contains(&n))
+                .then(|| t.child(node, "value").and_then(|v| t.elements(v).next()).map(|e| t.text(e)))
+                .flatten()
+                .filter(|v| !v.is_empty());
+            let presence = t.attr(node, "presence").map(parse_presence);
+            if let Some(i) = self.inst_mut(n) {
+                if let Some(v) = value {
+                    i.value = v;
+                }
+                if let Some(p) = presence {
+                    i.presence = p;
+                }
+            }
+        }
+    }
+
+    /// Put unbound fields' values into the form state packet (created if needed).
+    fn update_form_packet(&mut self) {
+        let unbound = self.unbound();
+        let values: Vec<(String, String, String)> = unbound
+            .iter()
+            .filter_map(|n| {
+                let i = self.inst(*n)?;
+                let t = self.tree();
+                let tag = t.child(i.t, "value").and_then(|v| t.elements(v).next()).map(|e| t.tag(e).to_string()).unwrap_or_else(|| "text".into());
+                Some((i.som.clone(), i.value.clone(), tag))
+            })
+            .collect();
+        if self.xdp.form.is_none() && values.iter().all(|(_, v, _)| v.is_empty()) {
+            return;
+        }
+        let tree = &mut self.xdp.tree;
+        let form = match self.xdp.form {
+            Some(f) => f,
+            None => {
+                let Some(top) = self.xdp.template.and_then(|t| tree.parent(t)) else { return };
+                let f = tree.append_element(top, "form");
+                tree.set_attr(f, "xmlns", "http://www.xfa.org/schema/xfa-form/2.8/");
+                self.xdp.form = Some(f);
+                f
+            }
+        };
+        let before = tree.to_string_of(form);
+        let index = form_index(tree, form);
+        for (som, value, tag) in values {
+            let node = match index.get(&normalize(&som)) {
+                Some(n) => *n,
+                None => match form_path(tree, form, &som) {
+                    Some(n) => n,
+                    None => continue,
+                },
+            };
+            let v = match tree.child(node, "value") {
+                Some(v) => v,
+                None => tree.append_element(node, "value"),
+            };
+            tree.set_attr(v, "override", "1");
+            let old: Vec<NodeId> = tree.children(v).to_vec();
+            for c in old {
+                tree.detach(c);
+            }
+            if !value.is_empty() {
+                let e = tree.append_element(v, &tag);
+                tree.set_text(e, &value);
+            }
+        }
+        if tree.to_string_of(form) != before {
+            self.form_dirty = true;
+        }
+    }
+
     /// Write the data (when it changed) and the script changes into the document.
     pub fn save(&mut self, doc: &mut Document) -> Result<(), XfaError> {
+        self.update_form_packet();
+        if self.form_dirty {
+            packet::write_form(doc, &self.xdp)?;
+            crate::drop_usage_rights(doc);
+            self.form_dirty = false;
+        }
         if self.data_changed {
             packet::write_datasets(doc, &self.xdp)?;
             crate::drop_usage_rights(doc);
             self.data_changed = false;
         }
         let state = self.state_text();
-        if state != read_state(doc).unwrap_or_default() {
+        if !self.frozen && state != read_state(doc).unwrap_or_default() {
             write_state(doc, &state)?;
         }
         Ok(())
@@ -1159,6 +1291,93 @@ fn write_state(doc: &mut Document, text: &str) -> Result<(), XfaError> {
     app.set(b"Private".to_vec(), Object::Dict(private));
     pi.set(PIECE.to_vec(), Object::Dict(app));
     doc.update_dict(root, |c| c.set(b"PieceInfo".to_vec(), Object::Dict(pi))).map_err(|e| XfaError::Pdf(e.to_string()))
+}
+
+/// Containers of a form state packet by normalized SOM (`form1.Page1.NAME`).
+fn form_index(tree: &Tree, form: NodeId) -> HashMap<String, NodeId> {
+    let mut out = HashMap::new();
+    for root in tree.elements(form).filter(|e| tree.tag(*e) == "subform").take(1) {
+        let key = tree.attr(root, "name").filter(|n| !n.is_empty()).unwrap_or("#subform");
+        let som = format!("{key}[0]");
+        out.insert(normalize(&som), root);
+        form_walk(tree, root, &som, &mut out, 0);
+    }
+    out
+}
+
+/// The container children of a form packet node, looking through subform sets and areas.
+fn form_kids(tree: &Tree, n: NodeId, depth: usize) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    if depth > MAX_DEPTH {
+        return out;
+    }
+    for c in tree.elements(n) {
+        match tree.tag(c) {
+            "subform" | "field" | "exclGroup" | "draw" => out.push(c),
+            "subformSet" | "area" => out.extend(form_kids(tree, c, depth + 1)),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn form_walk(tree: &Tree, n: NodeId, prefix: &str, out: &mut HashMap<String, NodeId>, depth: usize) {
+    if depth > MAX_DEPTH || out.len() > 500_000 {
+        return;
+    }
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for c in form_kids(tree, n, 0) {
+        let key = match tree.attr(c, "name").filter(|x| !x.is_empty()) {
+            Some(nm) => nm.to_string(),
+            None => format!("#{}", tree.tag(c)),
+        };
+        let k = counts.entry(key.clone()).or_insert(0);
+        let som = format!("{prefix}.{key}[{k}]");
+        *k += 1;
+        out.insert(normalize(&som), c);
+        form_walk(tree, c, &som, out, depth + 1);
+    }
+}
+
+/// Create the form packet nodes for SOM `som` (subforms, then the field); returns the field.
+fn form_path(tree: &mut Tree, form: NodeId, som: &str) -> Option<NodeId> {
+    let parts: Vec<&str> = realize::som_parts(som);
+    let mut at = form;
+    let last = parts.len().checked_sub(1)?;
+    for (i, part) in parts.iter().enumerate() {
+        let (name, idx) = match part.split_once('[') {
+            Some((n, rest)) => (n, rest.trim_end_matches(']').parse::<usize>().ok()?),
+            None => (*part, 0),
+        };
+        if name.starts_with("#pageSet") || idx > 1_000 {
+            return None;
+        }
+        let tag = if i == last { "field" } else { "subform" };
+        let unnamed = name.starts_with('#');
+        let same = |t: &Tree, c: NodeId| {
+            if unnamed {
+                t.tag(c) == name.trim_start_matches('#') && t.attr(c, "name").is_none_or(str::is_empty)
+            } else {
+                t.attr(c, "name") == Some(name)
+            }
+        };
+        let existing: Vec<NodeId> = tree.elements(at).filter(|c| same(tree, *c)).collect();
+        at = match existing.get(idx) {
+            Some(n) => *n,
+            None => {
+                let mut made = None;
+                for _ in existing.len()..=idx {
+                    let e = tree.append_element(at, if unnamed { name.trim_start_matches('#') } else { tag });
+                    if !unnamed {
+                        tree.set_attr(e, "name", name);
+                    }
+                    made = Some(e);
+                }
+                made?
+            }
+        };
+    }
+    Some(at)
 }
 
 /// Local name of an element, for matching SOM steps against data nodes.

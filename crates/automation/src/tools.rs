@@ -233,9 +233,12 @@ pub fn tools() -> Vec<ToolDef> {
         t(
             "form_press_button",
             "Press a form button",
-            "Press a button of an XFA form (field name from form_fields): its click scripts run (add or remove a table row, show or hide a section, …), then the form's calculations; the pages are laid out again when the form's structure changed. Returns the document summary and what the scripts said (messages, errors). Filling fields with form_fill runs the XFA form's change and exit scripts and calculations the same way. Undoable.",
+            "Click a button or field of an XFA form (field name from form_fields): its click scripts run (add or remove a table row, show or hide a section, …), then the form's calculations; the pages are laid out again when the form's structure changed. Returns the document summary and what the scripts said (messages, errors). Filling fields with form_fill runs the XFA form's change and exit scripts and calculations the same way. Undoable.",
         )
-        .with(schema(json!({ "doc": doc(), "field": { "type": "string" } }), &["doc", "field"])),
+        .with(schema(
+            json!({ "doc": doc(), "field": { "type": "string" }, "answers": { "type": "array", "items": { "type": "string" }, "description": "Values to pick in the pop-up menus the scripts show, in order. Without enough answers the result is needs_choice with the menu's labels and values, and nothing changes." } }),
+            &["doc", "field"],
+        )),
         t("form_reset", "Clear form", "Reset fields to their default values: all of them, or only those listed. Undoable.")
             .destructive()
             .with(schema(json!({ "doc": doc(), "fields": { "type": "array", "items": { "type": "string" } } }), &["doc"])),

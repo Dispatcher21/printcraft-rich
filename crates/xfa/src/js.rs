@@ -363,6 +363,72 @@ var __module = function (__s, __src) { return (function () { with (__s) { return
 var __mkList = function (a) { Object.defineProperty(a, "item", { value: function (i) { var v = this[i]; return v === undefined ? null : v; } }); return a; };
 "#;
 
+/// Acrobat helpers written in JavaScript: pop-up menus and `util`.
+const APP_PRELUDE: &str = r#"
+var __flatMenu = function (items, prefix, out) {
+  for (var i = 0; i < items.length && out.length < 5000; i++) {
+    var it = items[i];
+    if (it === null || it === undefined) continue;
+    if (it instanceof Array) { if (it.length) __flatMenu(it.slice(1), prefix + String(it[0]) + " > ", out); continue; }
+    if (typeof it !== "object") { if (String(it) !== "-") out.push([prefix + String(it), String(it)]); continue; }
+    var name = it.cName === undefined ? "" : String(it.cName);
+    if (name === "-" || it.bEnabled === false) continue;
+    if (it.oSubMenu) { __flatMenu(it.oSubMenu instanceof Array ? it.oSubMenu : [it.oSubMenu], prefix + name + " > ", out); continue; }
+    out.push([prefix + name, it.cReturn === undefined ? name : String(it.cReturn)]);
+  }
+  return out;
+};
+app.popUpMenuEx = function () { return __menu(__flatMenu(Array.prototype.slice.call(arguments), "", [])); };
+app.popUpMenu = function () { return __menu(__flatMenu(Array.prototype.slice.call(arguments), "", [])); };
+var util = {
+  printd: function (f, d) {
+    if (!(d instanceof Date)) d = new Date(d);
+    if (isNaN(d.getTime())) return "";
+    var p = function (n, w) { n = String(n); while (n.length < w) n = "0" + n; return n; };
+    if (f === 0) f = "D:yyyymmddHHMMss"; else if (f === 1) f = "yyyy.mm.dd HH:MM:ss"; else if (f === 2) f = "m/d/yy h:MM tt";
+    var M = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+    var D = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+    return String(f).replace(/yyyy|yy|mmmm|mmm|mm|m|dddd|ddd|dd|d|HH|H|hh|h|MM|M|ss|s|tt|t/g, function (t) {
+      switch (t) {
+        case "yyyy": return p(d.getFullYear(), 4);
+        case "yy": return p(d.getFullYear() % 100, 2);
+        case "mmmm": return M[d.getMonth()];
+        case "mmm": return M[d.getMonth()].substr(0, 3);
+        case "mm": return p(d.getMonth() + 1, 2);
+        case "m": return String(d.getMonth() + 1);
+        case "dddd": return D[d.getDay()];
+        case "ddd": return D[d.getDay()].substr(0, 3);
+        case "dd": return p(d.getDate(), 2);
+        case "d": return String(d.getDate());
+        case "HH": return p(d.getHours(), 2);
+        case "H": return String(d.getHours());
+        case "hh": return p(d.getHours() % 12 || 12, 2);
+        case "h": return String(d.getHours() % 12 || 12);
+        case "MM": return p(d.getMinutes(), 2);
+        case "M": return String(d.getMinutes());
+        case "ss": return p(d.getSeconds(), 2);
+        case "s": return String(d.getSeconds());
+        case "tt": return d.getHours() < 12 ? "am" : "pm";
+        default: return d.getHours() < 12 ? "a" : "p";
+      }
+    });
+  },
+  printf: function (fmt) {
+    var a = arguments, i = 1;
+    return String(fmt).replace(/%([-+ 0#,]*)(\d*)(?:\.(\d+))?([dfsx%])/g, function (m, fl, w, pr, c) {
+      if (c === "%") return "%";
+      var v = a[i++];
+      if (c === "d") v = String(Math.trunc(Number(v)));
+      else if (c === "f") v = Number(v).toFixed(pr === undefined ? 6 : +pr);
+      else if (c === "x") v = Math.trunc(Number(v)).toString(16);
+      else v = String(v);
+      while (v.length < +w) v = (fl.indexOf("0") >= 0 && c !== "s" ? "0" : " ") + v;
+      return v;
+    });
+  }
+};
+"#;
+
 fn native(ctx: &mut Context, f: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>) -> JsValue {
     FunctionObjectBuilder::new(ctx.realm(), NativeFunction::from_fn_ptr(f)).build().into()
 }
@@ -396,6 +462,25 @@ fn nothing(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
     Ok(JsValue::null())
 }
 
+/// `app.popUpMenuEx` / `app.popUpMenu` (items flattened by the prelude into [label, value]).
+fn menu(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let list = arg(args, 0);
+    let Some(o) = list.as_object() else { return Ok(JsValue::null()) };
+    let arr = JsArray::from_object(o)?;
+    let n = arr.length(ctx)?.min(5_000);
+    let mut items = Vec::new();
+    for i in 0..n {
+        let item = arr.get(i, ctx)?;
+        let Some(pair) = item.as_object() else { continue };
+        let pair = JsArray::from_object(pair)?;
+        let label = pair.get(0, ctx)?.to_string(ctx)?.to_std_string_escaped();
+        let value = pair.get(1, ctx)?.to_string(ctx)?.to_std_string_escaped();
+        items.push((label, value));
+    }
+    let r = with_host(ctx, |h| h.menu(items))?.map_err(error)?;
+    to_js(r, ctx)
+}
+
 fn launch_url(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let u = arg(args, 0).to_string(ctx)?.to_std_string_escaped();
     with_host(ctx, |h| {
@@ -422,7 +507,8 @@ impl Runtime {
         ctx.eval(Source::from_bytes(PRELUDE))?;
         let xfa = proxy(Obj::Xfa, &mut ctx)?;
         ctx.register_global_property(js_string!("xfa"), xfa, Attribute::all())?;
-        let event = proxy(Obj::Event, &mut ctx)?;
+        // Acrobat's `event` (its `target` is the document); `xfa.event` is the XFA one.
+        let event = proxy(Obj::AcroEvent, &mut ctx)?;
         ctx.register_global_property(js_string!("event"), event, Attribute::all())?;
         let (alert_f, println_f, nothing_f, url_f) =
             (native(&mut ctx, alert), native(&mut ctx, println), native(&mut ctx, nothing), native(&mut ctx, launch_url));
@@ -435,6 +521,7 @@ impl Runtime {
             .property(js_string!("clearTimeOut"), nothing_f.clone(), Attribute::all())
             .property(js_string!("clearInterval"), nothing_f.clone(), Attribute::all())
             .property(js_string!("launchURL"), url_f, Attribute::all())
+            .property(js_string!("execMenuItem"), nothing_f.clone(), Attribute::all())
             .property(js_string!("viewerType"), s("Exchange-Pro"), Attribute::all())
             .property(js_string!("viewerVariation"), s("Full"), Attribute::all())
             .property(js_string!("viewerVersion"), JsValue::from(11), Attribute::all())
@@ -448,6 +535,9 @@ impl Runtime {
             .property(js_string!("clear"), nothing_f, Attribute::all())
             .build();
         ctx.register_global_property(js_string!("console"), console, Attribute::all())?;
+        let menu_f = native(&mut ctx, menu);
+        ctx.register_global_property(js_string!("__menu"), menu_f, Attribute::all())?;
+        ctx.eval(Source::from_bytes(APP_PRELUDE))?;
         Ok(Runtime { ctx })
     }
 

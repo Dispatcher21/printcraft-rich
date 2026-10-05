@@ -81,7 +81,13 @@ fn named_crypt_filter(dict: &Dict) -> Option<Vec<u8>> {
     Some(parms.and_then(|p| p.name(b"Name").map(|n| n.to_vec())).unwrap_or_else(|| b"Identity".to_vec()))
 }
 
-/// Decrypt (`decrypt = true`) or encrypt every string and stream in an indirect object.
+/// A signature or document timestamp dictionary.
+fn is_signature(d: &Dict) -> bool {
+    matches!(d.name(b"Type"), Some(b"Sig" | b"DocTimeStamp")) || (d.get(b"ByteRange").is_some() && d.get(b"Contents").is_some())
+}
+
+/// Decrypt (`decrypt = true`) or encrypt every string and stream in an indirect object (a
+/// signature's `/Contents` excepted).
 pub(crate) fn transform(h: &SecurityHandler, o: &Object, num: u32, generation: u16, decrypt: bool) -> Object {
     let strings = |s: &PdfString| {
         let bytes = if decrypt { h.decrypt_string(num, generation, &s.bytes) } else { h.encrypt_string(num, generation, &s.bytes) };
@@ -94,7 +100,18 @@ fn walk(o: &Object, strings: &dyn Fn(&PdfString) -> PdfString, h: &SecurityHandl
     match o {
         Object::String(s) => Object::String(strings(s)),
         Object::Array(a) => Object::Array(a.iter().map(|x| walk(x, strings, h, num, generation, decrypt)).collect()),
-        Object::Dict(d) => Object::Dict(d.iter().map(|(k, v)| (k.clone(), walk(v, strings, h, num, generation, decrypt))).collect()),
+        Object::Dict(d) => {
+            // A signature's /Contents is never encrypted (ISO 32000-2 §7.6.2): it is the
+            // signature over the file's bytes.
+            let sig = is_signature(d);
+            Object::Dict(
+                d.iter()
+                    .map(|(k, v)| {
+                        (k.clone(), if sig && k.as_slice() == b"Contents" { v.clone() } else { walk(v, strings, h, num, generation, decrypt) })
+                    })
+                    .collect(),
+            )
+        }
         Object::Stream(s) => {
             let dict: Dict = s.dict.iter().map(|(k, v)| (k.clone(), walk(v, strings, h, num, generation, decrypt))).collect();
             let ty = s.dict.name(b"Type");

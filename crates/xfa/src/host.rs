@@ -36,6 +36,14 @@ pub enum Obj {
     Event,
     Xfa,
     List(Vec<Obj>),
+    /// A named value in `<variables>` (`<text name="remarks">…</text>`).
+    Var(NodeId),
+    /// Acrobat's document object (`event.target` in XFA forms' JavaScript).
+    Doc,
+    /// An Acrobat field object (`this.getField(name)`).
+    AcroField(String),
+    /// Acrobat's `event` object (like `xfa.event`, but `target` is the document).
+    AcroEvent,
 }
 
 /// A script value.
@@ -96,6 +104,9 @@ pub struct Output {
     pub urls: Vec<String>,
     /// The field `setFocus` asked for (SOM).
     pub focus: Option<String>,
+    /// A script stopped to ask the user to pick one of these (label, value): a pop-up menu.
+    /// Run it again with the answer to finish.
+    pub ask: Option<Vec<(String, String)>>,
 }
 
 impl Output {
@@ -109,6 +120,9 @@ impl Output {
         if o.focus.is_some() {
             self.focus = o.focus;
         }
+        if o.ask.is_some() {
+            self.ask = o.ask;
+        }
     }
 }
 
@@ -121,6 +135,8 @@ pub enum Pending {
     Event(N, String),
     /// `execCalculate` / `recalculate`.
     Calculate,
+    /// `execEvent("calculate")`: this field's calculation.
+    CalculateOne(N),
 }
 
 /// Everything a running script can reach.
@@ -135,6 +151,10 @@ pub struct Host {
     /// Today's date, for `Date()` and friends.
     pub today: (i32, u32, u32),
     pub calculations: bool,
+    /// Signature fields that are signed (AcroForm names, normalized).
+    pub signed: std::collections::HashSet<String>,
+    /// Answers to pop-up menus, in the order scripts ask (`None`: dismissed).
+    pub answers: std::collections::VecDeque<Option<String>>,
 }
 
 fn class_name(tag: Tag) -> &'static str {
@@ -146,6 +166,9 @@ fn class_name(tag: Tag) -> &'static str {
         Tag::Area => "area",
     }
 }
+
+/// The error that stops a script waiting for the user's choice.
+pub const ASKING: &str = "the form is waiting for a choice";
 
 /// A SOM index.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -213,6 +236,8 @@ impl Host {
             pending: Vec::new(),
             today,
             calculations: true,
+            signed: Default::default(),
+            answers: Default::default(),
         }
     }
 
@@ -247,6 +272,9 @@ impl Host {
             }
             if let Some(s) = self.live.script_object(n, name) {
                 return Some(Obj::Script(n, s));
+            }
+            if let Some(v) = self.live.variable(n, name) {
+                return Some(Obj::Var(v));
             }
             if let Some(rest) = name.strip_prefix('_')
                 && let Some((p, t)) = self.live.manager(n, rest)
@@ -628,6 +656,34 @@ impl Host {
                 "length" => Some(Val::Num(l.len() as f64)),
                 _ => None,
             },
+            Obj::Var(v) => match name {
+                "value" | "rawValue" => s(&self.tree().text(*v)),
+                "name" => s(self.tree().attr(*v, "name").unwrap_or("")),
+                "className" => s(self.tree().tag(*v)),
+                _ => None,
+            },
+            Obj::Doc => match name {
+                "numPages" => Some(Val::Num(self.page_count as f64)),
+                "pageNum" => Some(Val::Num(0.0)),
+                "numFields" => Some(Val::Num(self.live.field_map().len() as f64)),
+                "documentFileName" | "path" | "title" => s(""),
+                _ => None,
+            },
+            Obj::AcroField(f) => match name {
+                "name" => s(f),
+                "type" => s(if self.is_signature(f) { "signature" } else { "text" }),
+                "value" | "valueAsString" => {
+                    let n = self.live.field_map().get(&crate::dom::normalize(f)).copied();
+                    Some(n.map(|n| self.raw_val(n)).unwrap_or(Val::Null))
+                }
+                _ => None,
+            },
+            Obj::AcroEvent => match name {
+                "target" => Some(Val::Obj(Obj::Doc)),
+                "targetName" => s(&self.event.target.and_then(|t| self.live.inst(t)).map(|i| i.som.clone()).unwrap_or_default()),
+                "rc" => Some(Val::Bool(true)),
+                _ => self.get(&Obj::Event, name)?,
+            },
             Obj::Layout | Obj::Script(..) => None,
         })
     }
@@ -805,6 +861,8 @@ impl Host {
             Obj::Xfa => matches!(name, "resolveNode" | "resolveNodes"),
             Obj::Data(_) => matches!(name, "resolveNode" | "resolveNodes"),
             Obj::List(_) => name == "item",
+            Obj::Doc => matches!(name, "getField" | "resetForm" | "calculateNow" | "print" | "syncAnnotScan"),
+            Obj::AcroField(_) => matches!(name, "signatureValidate" | "setFocus"),
             _ => false,
         }
     }
@@ -838,7 +896,7 @@ impl Host {
                     }
                     "execEvent" => {
                         let a = text(self, 0);
-                        self.pending.push(Pending::Event(n, a));
+                        self.pending.push(if a == "calculate" { Pending::CalculateOne(n) } else { Pending::Event(n, a) });
                         Ok(Val::Null)
                     }
                     "execCalculate" => {
@@ -1067,8 +1125,55 @@ impl Host {
                 let i = arg(0).number();
                 Ok((i >= 0.0).then(|| l.get(i as usize).cloned()).flatten().map(Val::Obj).unwrap_or(Val::Null))
             }
+            Obj::Doc => match name {
+                "getField" => {
+                    let f = text(self, 0);
+                    let known = self.live.field_map().contains_key(&crate::dom::normalize(&f)) || self.is_signature(&f);
+                    Ok(if known { Val::Obj(Obj::AcroField(f)) } else { Val::Null })
+                }
+                "calculateNow" => {
+                    self.pending.push(Pending::Calculate);
+                    Ok(Val::Null)
+                }
+                "print" => {
+                    self.out.prints += 1;
+                    Ok(Val::Null)
+                }
+                "resetForm" => {
+                    self.reset(None);
+                    self.pending.push(Pending::Calculate);
+                    Ok(Val::Null)
+                }
+                _ => Ok(Val::Null),
+            },
+            Obj::AcroField(f) => match name {
+                // 0: not signed; 4: signed (validity is checked by the signature panel).
+                "signatureValidate" => Ok(Val::Num(if self.signed.contains(&crate::dom::normalize(f)) { 4.0 } else { 0.0 })),
+                "setFocus" => {
+                    self.out.focus = Some(f.clone());
+                    Ok(Val::Null)
+                }
+                _ => Err(format!("{name} is not a method of this field")),
+            },
             _ => Err(format!("{name} is not a method of this object")),
         }
+    }
+
+    /// Whether `name` is a signature field.
+    fn is_signature(&self, name: &str) -> bool {
+        let want = crate::dom::normalize(name);
+        self.live.walk(0).into_iter().any(|n| {
+            self.live.inst(n).is_some_and(|i| crate::dom::normalize(&i.som) == want && self.tree().path(i.t, &["ui", "signature"]).is_some())
+        })
+    }
+
+    /// A pop-up menu: the next answer if one was given, else stop and ask.
+    pub fn menu(&mut self, items: Vec<(String, String)>) -> Result<Val, String> {
+        if let Some(a) = self.answers.pop_front() {
+            return Ok(a.map(Val::Str).unwrap_or(Val::Null));
+        }
+        self.out.ask = Some(items);
+        Err(ASKING.into())
     }
 
     /// The default presence when not specified, for `Prop` reads.

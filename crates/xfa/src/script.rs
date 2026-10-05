@@ -122,7 +122,8 @@ impl Engine {
 
     /// Run one script on `n`; its result (`None`: undefined or failed).
     pub fn exec(&mut self, n: N, src: &Src) -> Option<Val> {
-        if self.runs >= MAX_RUNS {
+        // Out of budget, or a script is waiting for the user's choice: nothing more runs.
+        if self.runs >= MAX_RUNS || self.with(|h| h.out.ask.is_some()).unwrap_or(false) {
             return None;
         }
         self.runs += 1;
@@ -136,6 +137,7 @@ impl Engine {
         };
         let out = match r {
             Ok(v) => v,
+            Err(e) if e.contains(crate::host::ASKING) => None,
             Err(e) => {
                 self.with(|h| {
                     if h.out.errors.len() < MAX_ERRORS {
@@ -162,6 +164,7 @@ impl Engine {
                 Pending::Initialize(n) => self.initialize(n),
                 Pending::Event(n, a) => self.fire(n, &a),
                 Pending::Calculate => self.recalc = true,
+                Pending::CalculateOne(n) => self.calculate_one(n),
             }
         }
         self.nesting -= 1;
@@ -213,6 +216,16 @@ impl Engine {
         });
         for n in nodes.unwrap_or_default() {
             self.fire(n, "initialize");
+        }
+    }
+
+    /// Run `n`'s calculation (`execEvent("calculate")`).
+    pub fn calculate_one(&mut self, n: N) {
+        let Some(s) = self.live(|l| calculate_script(l, n)).flatten() else { return };
+        if let Some(v) = self.exec(n, &s) {
+            self.with(|h| {
+                let _ = h.set(&Obj::Node(n), "rawValue", v);
+            });
         }
     }
 
@@ -307,15 +320,16 @@ pub struct Change {
 pub fn edit(engine: &mut Engine, changes: &[Change]) {
     for c in changes {
         let n = c.field;
-        let Some((tag, is_check, members, display_new, display_old)) = engine
+        let Some((tag, is_check, is_text, members, display_new, display_old)) = engine
             .live(|l| {
                 let inst = l.inst(n)?;
                 let is_check = l.tree().path(inst.t, &["ui", "checkButton"]).is_some();
+                let is_text = inst.tag == Tag::Field && !is_check && l.tree().path(inst.t, &["ui", "choiceList"]).is_none();
                 let display = |v: &Option<String>| -> String {
                     let raw = v.clone().unwrap_or_default();
                     l.items(n).into_iter().find(|(s, _)| *s == raw).map(|(_, d)| d).unwrap_or(raw)
                 };
-                Some((inst.tag, is_check, inst.children.clone(), display(&c.after), display(&c.before)))
+                Some((inst.tag, is_check, is_text, inst.children.clone(), display(&c.after), display(&c.before)))
             })
             .flatten()
         else {
@@ -325,7 +339,10 @@ pub fn edit(engine: &mut Engine, changes: &[Change]) {
         engine.with(|h| h.live.set_raw(n, c.before.as_deref()));
         engine.set_event("change", Some(n), &display_new, &display_old);
         engine.fire(n, "change");
-        engine.with(|h| h.live.set_raw(n, c.after.as_deref()));
+        // Keystroke filters rewrite `xfa.event.change` (here: the whole new text).
+        let filtered = engine.with(|h| h.event.change.clone()).unwrap_or_default();
+        let after = if is_text && filtered != display_new { Some(filtered).filter(|f| !f.is_empty()) } else { c.after.clone() };
+        engine.with(|h| h.live.set_raw(n, after.as_deref()));
         if is_check {
             engine.set_event("click", Some(n), &display_new, &display_old);
             engine.fire(n, "click");
@@ -356,6 +373,13 @@ pub fn click(engine: &mut Engine, n: N) {
     engine.fire(n, "mouseDown");
     engine.fire(n, "mouseUp");
     engine.fire(n, "click");
+    engine.calculate_all(0);
+}
+
+/// Before a signature field is signed: its `preSign` scripts, then the calculations.
+pub fn pre_sign(engine: &mut Engine, n: N) {
+    engine.set_event("preSign", Some(n), "", "");
+    engine.fire(n, "preSign");
     engine.calculate_all(0);
 }
 

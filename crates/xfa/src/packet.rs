@@ -25,6 +25,8 @@ pub struct Xdp {
     pub template: Option<NodeId>,
     /// The `<xfa:datasets>` element.
     pub datasets: Option<NodeId>,
+    /// The `<form>` packet (the form's saved state: unbound fields' values), if any.
+    pub form: Option<NodeId>,
     pub(crate) layout: Layout,
 }
 
@@ -82,7 +84,8 @@ pub fn read(doc: &Document) -> Result<Xdp, XfaError> {
     let top = xdp.unwrap_or(Tree::ROOT);
     let template = tree.child(top, "template");
     let datasets = tree.child(top, "datasets");
-    Ok(Xdp { tree, template, datasets, layout })
+    let form = tree.elements(top).find(|e| tree.tag(*e) == "form");
+    Ok(Xdp { tree, template, datasets, form, layout })
 }
 
 /// The `<xfa:data>` element (created, with a datasets packet, when missing).
@@ -109,9 +112,9 @@ pub fn data_root(xdp: &mut Xdp) -> NodeId {
     }
 }
 
-/// The datasets packet as a standalone XML fragment, with the namespace declaration of its
-/// prefix even when the original declared it on the `xdp` element.
-fn datasets_text(xdp: &Xdp, datasets: NodeId) -> String {
+/// A packet as a standalone XML fragment, with the namespace declaration of its prefix even
+/// when the original declared it on the `xdp` element.
+fn packet_text(xdp: &Xdp, datasets: NodeId) -> String {
     let mut tree = xdp.tree.clone();
     if let Some(name) = tree.name(datasets).map(str::to_string) {
         let decl = match name.split_once(':') {
@@ -142,6 +145,17 @@ fn xml_stream(text: &str) -> Stream {
 /// Write the (edited) datasets packet back into the PDF.
 pub fn write_datasets(doc: &mut Document, xdp: &Xdp) -> Result<(), XfaError> {
     let datasets = xdp.datasets.ok_or(XfaError::NoXfa)?;
+    write_packet(doc, xdp, datasets, "datasets")
+}
+
+/// Write the (edited or new) form state packet back into the PDF.
+pub fn write_form(doc: &mut Document, xdp: &Xdp) -> Result<(), XfaError> {
+    let form = xdp.form.ok_or(XfaError::NoXfa)?;
+    write_packet(doc, xdp, form, "form")
+}
+
+/// Write packet `node` (named `name` in the `/XFA` array) back into the PDF.
+fn write_packet(doc: &mut Document, xdp: &Xdp, node: NodeId, name: &str) -> Result<(), XfaError> {
     match &xdp.layout {
         Layout::Single(r) => {
             let mut text = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
@@ -149,9 +163,9 @@ pub fn write_datasets(doc: &mut Document, xdp: &Xdp) -> Result<(), XfaError> {
             doc.set(*r, Object::Stream(xml_stream(&text)));
         }
         Layout::Array { array, parts } => {
-            let text = datasets_text(xdp, datasets);
+            let text = packet_text(xdp, node);
             let mut parts = parts.clone();
-            match parts.iter().position(|(n, _)| n == "datasets") {
+            match parts.iter().position(|(n, _)| n == name) {
                 Some(i) => match parts.get(i).and_then(|(_, o)| o.as_ref()) {
                     Some(r) => doc.set(r, Object::Stream(xml_stream(&text))),
                     None => {
@@ -165,7 +179,7 @@ pub fn write_datasets(doc: &mut Document, xdp: &Xdp) -> Result<(), XfaError> {
                     let r = doc.add(Object::Stream(xml_stream(&text)));
                     // Before the closing packets, as Acrobat orders them.
                     let at = parts.iter().position(|(n, _)| n == "postamble" || n == "xmpmeta" || n == "</xdp:xdp>").unwrap_or(parts.len());
-                    parts.insert(at, ("datasets".to_string(), Object::Ref(r)));
+                    parts.insert(at, (name.to_string(), Object::Ref(r)));
                 }
             }
             let value = Object::Array(parts.into_iter().flat_map(|(n, o)| [Object::String(PdfString::literal(n.into_bytes())), o]).collect());

@@ -985,6 +985,7 @@ pub fn document_area(app: &mut PrintCraftApp, index: usize, ui: &mut egui::Ui) {
     let allowed = doc.allows_annotation();
     let comments_hidden = doc.comments_hidden();
     let form = doc.form.clone();
+    view.forms.xfa_clickable = doc.xfa_clickable.clone();
     let can_fill = doc.allows_form_filling();
     let can_crop = doc.allows_assembly();
     let mut open_boxes = false;
