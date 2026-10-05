@@ -213,6 +213,52 @@ pub struct Document {
     config: RenderConfig,
     /// What field scripts printed or asked for (see [`Session::take_js_output`]).
     js_output: js::JsOutput,
+    /// The document's XFA form, if it has one.
+    pub xfa: Option<XfaState>,
+}
+
+/// How an XFA form was handled on open.
+#[derive(Clone, Debug, PartialEq)]
+pub struct XfaState {
+    /// A dynamic form (pages laid out from the XFA template) rather than a static one.
+    pub dynamic: bool,
+    /// What laying out a dynamic form produced (pages, fields, what was left out).
+    pub report: Option<printcraft_xfa::Report>,
+    /// Why a dynamic form could not be laid out (its placeholder pages are shown instead).
+    pub error: Option<String>,
+}
+
+/// A laid-out XFA form: the new working bytes (an appended revision) and their parse.
+type Realized = (Arc<Vec<u8>>, printcraft_cos::Document);
+
+/// Lay out a dynamic XFA form as real pages and fields (`None` when the document has no XFA).
+fn realize_xfa(cos: &printcraft_cos::Document, password: Option<&str>) -> Option<(XfaState, Option<Realized>)> {
+    let kind = printcraft_xfa::kind(cos)?;
+    if kind == printcraft_xfa::Kind::Static {
+        return Some((XfaState { dynamic: false, report: None, error: None }, None));
+    }
+    let attempt = guard(|| -> Result<_, String> {
+        let mut doc = cos.clone();
+        let report = printcraft_xfa::realize(&mut doc).map_err(|e| e.to_string())?;
+        let bytes = Arc::new(write_incremental(&doc, &SaveOptions::default()).map_err(|e| e.to_string())?);
+        let reopened = printcraft_cos::Document::open_with_password(bytes.clone(), password).map_err(|e| e.to_string())?;
+        Ok((report, bytes, reopened))
+    });
+    Some(match attempt {
+        Ok(Ok((report, bytes, reopened))) => (XfaState { dynamic: true, report: Some(report), error: None }, Some((bytes, reopened))),
+        Ok(Err(e)) | Err(e) => (XfaState { dynamic: true, report: None, error: Some(e) }, None),
+    })
+}
+
+/// Copy form values into the XFA data before saving (a no-op without XFA).
+fn sync_xfa(cos: &mut printcraft_cos::Document) {
+    if printcraft_xfa::kind(cos).is_some() {
+        let mut synced = cos.clone();
+        // On failure the save goes ahead without it: the AcroForm values are still saved.
+        if let Ok(Ok(_)) = guard(|| printcraft_xfa::sync_datasets(&mut synced)) {
+            *cos = synced;
+        }
+    }
 }
 
 impl Document {
@@ -1762,7 +1808,19 @@ impl Session {
     }
 
     fn open_unguarded(&mut self, name: String, path: Option<String>, bytes: Arc<Vec<u8>>, password: Option<&str>) -> Result<DocId, OpenError> {
-        let cos = std::panic::catch_unwind(|| printcraft_cos::Document::open_with_password(bytes.clone(), password));
+        let mut cos = std::panic::catch_unwind(|| printcraft_cos::Document::open_with_password(bytes.clone(), password));
+        // A dynamic XFA form has only placeholder pages: lay it out first, and work on that.
+        let mut bytes = bytes;
+        let mut xfa = None;
+        if let Ok(Ok(d)) = &cos
+            && let Some((state, realized)) = realize_xfa(d, password)
+        {
+            if let Some((b, d)) = realized {
+                bytes = b;
+                cos = Ok(Ok(d));
+            }
+            xfa = Some(state);
+        }
         // The renderer authenticates on its own. It cannot use the owner password of R2–R4
         // files, so give it the user password that owner authentication recovers.
         let (info, render_password) = match inspect(bytes.clone(), password) {
@@ -1817,6 +1875,7 @@ impl Session {
             editor,
             config,
             js_output: Default::default(),
+            xfa,
         });
         Ok(id)
     }
@@ -1994,11 +2053,13 @@ impl Session {
     pub fn save_bytes(&self, id: DocId) -> Result<Arc<Vec<u8>>, EditError> {
         let doc = self.get(id).ok_or(EditError::NoDocument)?;
         let Some(editor) = doc.editor.as_ref() else { return Ok(doc.bytes.clone()) };
-        if !editor.cos.is_modified() {
-            return Ok(editor.cos.bytes().clone());
+        let mut cos = editor.cos.clone();
+        sync_xfa(&mut cos);
+        if !cos.is_modified() {
+            return Ok(cos.bytes().clone());
         }
         let opts = SaveOptions { mod_date: self.now().map(printcraft_cos::pdf_date), ..SaveOptions::default() };
-        guard(|| write_incremental(&editor.cos, &opts)).map_err(EditError::Write)?.map(Arc::new).map_err(|e| EditError::Write(e.to_string()))
+        guard(|| write_incremental(&cos, &opts)).map_err(EditError::Write)?.map(Arc::new).map_err(|e| EditError::Write(e.to_string()))
     }
 
     /// A compact, garbage-collected rewrite (Save As ▸ "Optimized" / Reduce File Size groundwork).
@@ -2008,8 +2069,10 @@ impl Session {
             return Err(EditError::Signed);
         }
         let editor = doc.editor.as_ref().ok_or_else(|| EditError::ReadOnly(doc.read_only_reason.clone().unwrap_or_default()))?;
+        let mut cos = editor.cos.clone();
+        sync_xfa(&mut cos);
         let opts = SaveOptions { mod_date: self.now().map(printcraft_cos::pdf_date), ..SaveOptions::default() };
-        guard(|| write_full(&editor.cos, &opts)).map_err(EditError::Write)?.map(Arc::new).map_err(|e| EditError::Write(e.to_string()))
+        guard(|| write_full(&cos, &opts)).map_err(EditError::Write)?.map(Arc::new).map_err(|e| EditError::Write(e.to_string()))
     }
 
     /// Record a successful save of `bytes` (to `path`, if any): rebase editing on the saved file

@@ -5079,11 +5079,11 @@ title = "View and fill static XFA forms"
 area = "F"
 tier = "P1"
 milestone = "M12"
-status = "planned"
+status = "partial"
 commands = []
 tools = []
-evidence = []
-notes = ""
+evidence = ["crates/xfa/src/tests.rs::static_forms_save_values_into_the_xfa_data"]
+notes = "filling uses the AcroForm mirror; values are written back into the XFA datasets on save. No XFA scripts"
 
 [[feature]]
 id = "form.xfa-dynamic"
@@ -5091,11 +5091,11 @@ title = "View and fill dynamic XFA forms"
 area = "F"
 tier = "P1"
 milestone = "M12"
-status = "planned"
+status = "partial"
 commands = []
 tools = []
-evidence = []
-notes = ""
+evidence = ["crates/xfa/src/tests.rs::dynamic_form_becomes_pages_and_fields", "crates/engine/src/tests.rs::dynamic_xfa_forms_open_as_fillable_pages_and_save_into_the_xfa_data"]
+notes = "laid out on open (positioned, tb, lr-tb, row/table, page breaks, repeating subforms, master pages, prototypes, date pictures). Missing: scripts, adding rows interactively, text split across pages, linked images, barcodes"
 
 [[feature]]
 id = "form.xfa-formcalc"

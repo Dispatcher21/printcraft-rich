@@ -3872,6 +3872,7 @@ dependencies = [
  "printcraft-redact",
  "printcraft-render",
  "printcraft-sign",
+ "printcraft-xfa",
  "printcraft-xfdf",
  "thiserror 2.0.21",
 ]
@@ -4069,6 +4070,18 @@ dependencies = [
  "printcraft-ui-egui",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "printcraft-xfa"
+version = "0.1.1"
+dependencies = [
+ "hayro-syntax",
+ "png 0.18.1",
+ "printcraft-cos",
+ "printcraft-fonts",
+ "printcraft-forms",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

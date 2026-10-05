@@ -1410,3 +1410,63 @@ fn guard_turns_a_panic_into_an_error() {
     let n = 3;
     assert_eq!(guard(|| -> u8 { panic!("page {n} is bad") }), Err("page 3 is bad".to_string()));
 }
+
+/// A dynamic XFA form (placeholder page only) with one text field bound to `<Name>`.
+fn xfa_fixture() -> Vec<u8> {
+    let template = r#"<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form1" layout="tb"><pageSet><pageArea name="P"><contentArea x="0.5in" y="0.5in" w="7.5in" h="10in"/><medium stock="letter"/></pageArea></pageSet><subform name="Page1" w="7.5in" h="2in"><draw name="Title" w="7.5in" h="0.5in"><value><text>SYNTHETIC FORM</text></value></draw><field name="Name" y="1in" w="4in" h="0.4in"><ui><textEdit/></ui></field></subform></subform></template>"#;
+    let datasets = r#"<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form1><Page1><Name>Ann</Name></Page1></form1></xfa:data></xfa:datasets>"#;
+    let stream = |d: &str| format!("<< /Length {} >>\nstream\n{d}\nendstream", d.len()).into_bytes();
+    let objs: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R /NeedsRendering true >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+        b"<< /Fields [] /XFA [(preamble) 5 0 R (template) 6 0 R (datasets) 7 0 R (postamble) 8 0 R] >>".to_vec(),
+        stream(r#"<xdp:xdp xmlns:xdp="http://ns.adobe.com/xdp/">"#),
+        stream(template),
+        stream(datasets),
+        stream("</xdp:xdp>"),
+    ];
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, o) in objs.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        out.extend_from_slice(o);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+    for o in offsets {
+        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).as_bytes());
+    out
+}
+
+#[test]
+fn dynamic_xfa_forms_open_as_fillable_pages_and_save_into_the_xfa_data() {
+    let mut s = Session::new();
+    let id = s.open("form.pdf", None, Arc::new(xfa_fixture()), None).unwrap();
+    let doc = s.get(id).unwrap();
+    let xfa = doc.xfa.clone().unwrap();
+    assert!(xfa.dynamic && xfa.error.is_none(), "{xfa:?}");
+    assert_eq!(doc.info.pages.len(), 1);
+    assert!(!doc.dirty);
+    let name = doc.form.iter().find(|f| f.name == "form1[0].Page1[0].Name[0]").unwrap();
+    assert_eq!(name.value, vec!["Ann".to_string()]);
+    // The laid-out page renders with the form's text.
+    let text = page_texts(&s, id).join(" ");
+    assert!(text.contains("SYNTHETIC FORM"), "{text}");
+    s.apply(id, Edit::SetFieldValue { name: "form1[0].Page1[0].Name[0]".into(), value: FieldValue::Text("Bea".into()) }).unwrap();
+    let saved = s.save_bytes(id).unwrap();
+    s.mark_saved(id, saved.clone(), None).unwrap();
+    // Acrobat reads the XFA data: the saved file carries the new value there.
+    let cos = printcraft_cos::Document::open(saved.clone()).unwrap();
+    let xdp = printcraft_xfa::packet::read(&cos).unwrap();
+    let data = xdp.datasets.map(|d| xdp.tree.to_string_of(d)).unwrap_or_default();
+    assert!(data.contains("<Name>Bea</Name>"), "{data}");
+    // Opening the saved file lays it out again from that data.
+    let again = s.open("saved.pdf", None, saved, None).unwrap();
+    let name = s.get(again).unwrap().form.iter().find(|f| f.name == "form1[0].Page1[0].Name[0]").cloned().unwrap();
+    assert_eq!(name.value, vec!["Bea".to_string()]);
+}
