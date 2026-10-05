@@ -52,7 +52,8 @@ impl<'a> Pattern<'a> {
         }
     }
 
-    pub(crate) fn pre_concat_transform(&mut self, transform: Affine) {
+    /// PrintCraft patch: public so a recorded display list can re-target patterns.
+    pub fn pre_concat_transform(&mut self, transform: Affine) {
         match self {
             Self::Shading(p) => {
                 p.matrix = transform * p.matrix;

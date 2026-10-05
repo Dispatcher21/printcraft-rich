@@ -373,30 +373,51 @@ pub fn layout(glyphs: Vec<TextGlyph>) -> PageText {
             segs.push(Seg { idx: vec![i], bbox: g, h: height(i) });
         }
     }
-    // Merge same-baseline segments that nearly touch.
-    let mut merged = true;
-    while merged {
-        merged = false;
-        'outer: for a in 0..segs.len() {
-            for b in 0..segs.len() {
-                if a == b {
-                    continue;
+    // Merge same-baseline segments that nearly touch. Sweep in baseline order (only segments
+    // within 0.3 line heights can merge), merging each segment at most once per pass and
+    // repeating until nothing changes: all-pairs passes were cubic on drawings with thousands
+    // of labels.
+    let mergeable = |sa: &Seg, sb: &Seg| {
+        let h = sa.h.min(sb.h);
+        let gap = (sb.bbox[0] - sa.bbox[2]).max(sa.bbox[0] - sb.bbox[2]);
+        (sa.cy() - sb.cy()).abs() < h * 0.3 && ((sa.h / sb.h - 1.0).abs() < 0.35 || (sb.h / sa.h - 1.0).abs() < 0.35) && gap < h * 1.2
+    };
+    loop {
+        let mut by_cy: Vec<usize> = (0..segs.len()).collect();
+        by_cy.sort_by(|a, b| segs[*a].cy().total_cmp(&segs[*b].cy()));
+        let mut gone = vec![false; segs.len()];
+        let mut merged_now = vec![false; segs.len()];
+        let mut pairs = Vec::new();
+        for (k, &a) in by_cy.iter().enumerate() {
+            if merged_now[a] {
+                continue;
+            }
+            let reach = segs[a].h * 0.3;
+            for &b in by_cy.iter().skip(k + 1) {
+                if segs[b].cy() - segs[a].cy() >= reach {
+                    break;
                 }
-                let (sa, sb) = (&segs[a], &segs[b]);
-                let h = sa.h.min(sb.h);
-                let gap = (sb.bbox[0] - sa.bbox[2]).max(sa.bbox[0] - sb.bbox[2]);
-                if (sa.cy() - sb.cy()).abs() < h * 0.3 && (sa.h / sb.h - 1.0).abs() < 0.35 && gap < h * 1.2 {
-                    let sb = segs.remove(b);
-                    let a = if b < a { a - 1 } else { a };
-                    let sa = &mut segs[a];
-                    sa.idx.extend(sb.idx);
-                    union(&mut sa.bbox, &sb.bbox);
-                    sa.h = sa.h.max(sb.h);
-                    merged = true;
-                    break 'outer;
+                if !merged_now[b] && mergeable(&segs[a], &segs[b]) {
+                    merged_now[a] = true;
+                    merged_now[b] = true;
+                    pairs.push((a.min(b), a.max(b)));
+                    break;
                 }
             }
         }
+        if pairs.is_empty() {
+            break;
+        }
+        for (keep, drop) in pairs {
+            let sb = std::mem::replace(&mut segs[drop], Seg { idx: Vec::new(), bbox: [0.0; 4], h: 0.0 });
+            gone[drop] = true;
+            let sa = &mut segs[keep];
+            sa.idx.extend(sb.idx);
+            union(&mut sa.bbox, &sb.bbox);
+            sa.h = sa.h.max(sb.h);
+        }
+        let mut it = gone.iter();
+        segs.retain(|_| !*it.next().unwrap_or(&false));
     }
     for s in &mut segs {
         s.idx.sort_by(|a, b| glyphs[*a].rect[0].total_cmp(&glyphs[*b].rect[0]));
@@ -406,9 +427,15 @@ pub fn layout(glyphs: Vec<TextGlyph>) -> PageText {
     let mut by_top: Vec<usize> = (0..segs.len()).collect();
     by_top.sort_by(|a, b| segs[*a].bbox[1].total_cmp(&segs[*b].bbox[1]));
     let mut blocks: Vec<(Vec<usize>, [f32; 4])> = Vec::new();
+    // Blocks a later segment could still join, in creation order. Segments come top-down, so a
+    // block whose last line ends more than the tallest line's reach above is closed for good.
+    let max_h = segs.iter().map(|s| s.h).fold(0.0f32, f32::max);
+    let mut open: Vec<usize> = Vec::new();
     for si in by_top {
         let s = &segs[si];
-        let target = blocks.iter().position(|(members, bb)| {
+        open.retain(|b| blocks[*b].0.last().is_some_and(|m| s.bbox[1] - segs[*m].bbox[3] < max_h * 1.1));
+        let target = open.iter().copied().find(|b| {
+            let (members, bb) = &blocks[*b];
             let Some(&m) = members.last() else { return false };
             let last = &segs[m];
             let vgap = s.bbox[1] - last.bbox[3];
@@ -422,7 +449,10 @@ pub fn layout(glyphs: Vec<TextGlyph>) -> PageText {
                 let bb = s.bbox;
                 union(&mut blocks[b].1, &bb);
             }
-            None => blocks.push((vec![si], s.bbox)),
+            None => {
+                blocks.push((vec![si], s.bbox));
+                open.push(blocks.len() - 1);
+            }
         }
     }
 
@@ -477,6 +507,7 @@ pub fn layout(glyphs: Vec<TextGlyph>) -> PageText {
             let typical = gaps.get(gaps.len() / 3).copied().unwrap_or(0.0).max(0.0);
             let threshold = (typical + s.h * 0.15).max(s.h * 0.15);
             let mut spaces = vec![false; idx.len()];
+            let pos_of: std::collections::HashMap<usize, usize> = idx.iter().enumerate().map(|(k, g)| (*g, k)).collect();
             for w in 1..s.idx.len() {
                 let (p, c) = (s.idx[w - 1], s.idx[w]);
                 let gap = glyphs[c].rect[0] - glyphs[p].rect[2];
@@ -485,7 +516,7 @@ pub fn layout(glyphs: Vec<TextGlyph>) -> PageText {
                 let tight_cluster = (pt.chars().any(is_complex) || ct.chars().any(is_complex)) && gap < s.h * 0.6;
                 if gap > threshold && !cjk && !tight_cluster && !pt.trim().is_empty() && !ct.trim().is_empty() {
                     // Mark the space before glyph `c` wherever it ended up after RTL reversal.
-                    if let Some(pos) = idx.iter().position(|x| *x == c.max(p)) {
+                    if let Some(&pos) = pos_of.get(&c.max(p)) {
                         spaces[pos] = true;
                     }
                 }
@@ -590,5 +621,22 @@ mod tests {
         let mut v = Vec::new();
         word(&mut v, "每个字", 10.0, 10.0, 9.0);
         assert_eq!(layout(v).plain_text(), "每个字");
+    }
+
+    /// A drawing sheet with thousands of separate labels (grid callouts, dimensions) lays out
+    /// quickly; the old all-pairs merge was cubic and ran for minutes.
+    #[test]
+    fn many_labels_lay_out_quickly() {
+        let mut v = Vec::new();
+        for row in 0..100 {
+            for col in 0..100 {
+                word(&mut v, "A1", 10.0 + col as f32 * 60.0, 10.0 + row as f32 * 40.0, 6.0);
+            }
+        }
+        let start = std::time::Instant::now();
+        let t = layout(v);
+        assert!(start.elapsed().as_secs() < 20, "took {:?}", start.elapsed());
+        assert_eq!(t.glyphs.len(), 20_000);
+        assert_eq!(t.plain_text().split_whitespace().count(), 10_000);
     }
 }

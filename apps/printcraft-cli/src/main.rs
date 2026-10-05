@@ -10,6 +10,8 @@
 //! printcraft-cli extract <in.pdf> --pages 1,3,5 --out out.pdf
 //! printcraft-cli split   <in.pdf> (--every N | --before 3,7) [--out-dir DIR]
 //! printcraft-cli check  <files or dirs…> [--timeout 20] [--dpi 36] [--json out.json]
+//! printcraft-cli perf   <file.pdf> [--pages 5] [--zoom 400] [--password PW]
+//!                                                            timing and memory report for big files
 //! printcraft-cli tools                                       automation tools and their JSON Schemas
 //! printcraft-cli run    <tool> [key=value …] [--root DIR] [--out image.png]
 //! printcraft-cli run    --script steps.json [--root DIR]      [{"tool": "doc_open", "args": {…}}, …]
@@ -37,7 +39,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use printcraft_render::{PageRenderer, RenderConfig, RenderRequest, RequestKind, inspect};
+use printcraft_render::{PageRenderer, RenderConfig, RenderPool, RenderRequest, RequestKind, Tile, inspect};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -52,6 +54,7 @@ fn main() -> ExitCode {
             Some("split") => split(&args[1..]),
             Some("check") => check(&args[1..]),
             Some("check-one") => check_one(&args[1..]),
+            Some("perf") => perf(&args[1..]),
             Some("tools") => tools(),
             Some("run") => run(&args[1..]),
             Some("ui") => ui(&args[1..]),
@@ -64,7 +67,7 @@ fn main() -> ExitCode {
                 println!("Source:  {}", printcraft_engine::links::GITHUB);
                 Ok(())
             }
-            _ => Err("usage: printcraft-cli <info|render|text|edit|combine|extract|split|check|tools|run|mcp|ui> …  (see source header for options)\nhelp and feedback: https://discord.gg/artcraft"
+            _ => Err("usage: printcraft-cli <info|render|text|edit|combine|extract|split|check|perf|tools|run|mcp|ui> …  (see source header for options)\nhelp and feedback: https://discord.gg/artcraft"
                 .into()),
         };
     match result {
@@ -250,6 +253,94 @@ fn render(args: &[String]) -> Result<(), String> {
 }
 
 /// Child-process body for `check`: prints one JSON line.
+/// Timing and memory report for one (large) file, the way the app opens and views it: open,
+/// a fit-to-window render per page, then a zoomed-in pass of 1024 px tiles. Prints only sizes
+/// and timings, never content, so the report can be shared.
+fn perf(args: &[String]) -> Result<(), String> {
+    let path = *positional(args).first().ok_or("perf: missing file")?;
+    let max_pages: usize = flag(args, "--pages").unwrap_or("5").parse().map_err(|_| "bad --pages")?;
+    let zoom: f32 = flag(args, "--zoom").unwrap_or("400").parse().map_err(|_| "bad --zoom")?;
+    let password = flag(args, "--password");
+    let config = RenderConfig { password: password.map(Arc::from), ..RenderConfig::default() };
+    let t = Instant::now();
+    let bytes = read(path)?;
+    let read_ms = t.elapsed().as_millis();
+    let t = Instant::now();
+    let info = inspect(bytes.clone(), password).map_err(|e| e.to_string())?;
+    println!("file           {:.1} MB (read {read_ms} ms)", bytes.len() as f64 / 1e6);
+    println!(
+        "open           {} ms, PDF {}, {} pages{}",
+        t.elapsed().as_millis(),
+        info.pdf_version,
+        info.pages.len(),
+        if info.encrypted { ", encrypted" } else { "" }
+    );
+    if !info.warnings.is_empty() {
+        println!("warnings       {}", info.warnings.len());
+    }
+    println!("memory         {}", peak_memory());
+    let mut r = PageRenderer::new(bytes.clone(), config.clone());
+    for (i, p) in info.pages.iter().enumerate().take(max_pages) {
+        // Fit a 1600 x 1000 px window, as the app does on open.
+        let fit = (1600.0 / p.width.max(1.0)).min(1000.0 / p.height.max(1.0));
+        let page = r.render(RenderRequest { page: i, kind: RequestKind::Pixels, tile: None, scale: fit, tag: 0 });
+        let t = Instant::now();
+        let text = r.render(RenderRequest { page: i, kind: RequestKind::Text, tile: None, scale: 1.0, tag: 0 });
+        let text_ms = t.elapsed().as_millis();
+        println!(
+            "page {:<4}      {:.1} x {:.1} in, fit view {} ms, text layer {text_ms} ms{}",
+            i + 1,
+            p.width / 72.0,
+            p.height / 72.0,
+            page.millis,
+            page.error.or(text.error).map(|e| format!(", error: {e}")).unwrap_or_default()
+        );
+        // Zoomed in: a 3 x 2 block of 1024 px tiles from the middle of the page, on one worker
+        // so the per-tile cost is visible (the app spreads tiles over all cores).
+        let scale = zoom / 100.0;
+        let (w, h) = ((p.width * scale) as u32, (p.height * scale) as u32);
+        let (x0, y0) = ((w / 2).saturating_sub(1536), (h / 2).saturating_sub(1024));
+        let pool = RenderPool::new(bytes.clone(), 1, config.clone());
+        let tiles: Vec<RenderRequest> = (0..6u32)
+            .map(|k| RenderRequest {
+                page: i,
+                kind: RequestKind::Pixels,
+                tile: Some(Tile { x: x0 + (k % 3) * 1024, y: y0 + (k / 3) * 1024, w: 1024, h: 1024 }),
+                scale,
+                tag: k as u64,
+            })
+            .collect();
+        let t = Instant::now();
+        pool.set_queue(tiles);
+        let mut times = Vec::new();
+        while times.len() < 6 && t.elapsed() < Duration::from_secs(300) {
+            match pool.try_recv() {
+                Some(p) => times.push((p.request.tag, p.millis, p.error)),
+                None => std::thread::sleep(Duration::from_millis(2)),
+            }
+        }
+        times.sort_by_key(|t| t.0);
+        let first = times.first().map(|t| t.1).unwrap_or(0);
+        let rest: Vec<u32> = times.iter().skip(1).map(|t| t.1).collect();
+        let avg = if rest.is_empty() { 0 } else { rest.iter().sum::<u32>() / rest.len() as u32 };
+        let errors = times.iter().filter(|t| t.2.is_some()).count();
+        println!(
+            "  zoom {zoom}%    first tile {first} ms, next tiles {avg} ms each{}",
+            if errors > 0 { format!(", {errors} tiles failed") } else { String::new() }
+        );
+    }
+    println!("peak memory    {}", peak_memory());
+    Ok(())
+}
+
+/// Peak resident memory of this process, where the platform reports it.
+fn peak_memory() -> String {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM:")).map(|l| l.trim_start_matches("VmHWM:").trim().to_string()))
+        .unwrap_or_else(|| "n/a on this platform".into())
+}
+
 fn check_one(args: &[String]) -> Result<(), String> {
     let path = *positional(args).first().ok_or("check-one: missing file")?;
     let dpi: f32 = flag(args, "--dpi").unwrap_or("36").parse().map_err(|_| "bad --dpi")?;

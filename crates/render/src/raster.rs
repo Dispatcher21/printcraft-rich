@@ -7,8 +7,14 @@
 //! **Robustness:** every page render runs under `catch_unwind`. A panic inside the renderer on a
 //! malformed page yields a `RenderedPage` with `error` set, and the worker rebuilds its parser and
 //! cache before continuing, so one bad page can never take down the app or poison later pages.
+//!
+//! **Heavy pages:** the first tile request for a page makes the worker record the page's drawing
+//! as a display list ([`hayro::DisplayList`]); later tiles replay it, skipping everything outside
+//! the tile, instead of interpreting the content stream again. Workers prefer queued tiles of the
+//! page they hold a list for, and all workers of a pool share one memory budget for lists.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -16,7 +22,7 @@ use std::thread::JoinHandle;
 use hayro::hayro_interpret::InterpreterSettings;
 use hayro::hayro_syntax::Pdf;
 use hayro::vello_cpu::color::palette::css::WHITE;
-use hayro::{RenderCache, RenderSettings, render};
+use hayro::{DisplayList, RenderCache, RenderSettings, render, render_display_list};
 
 /// Monotonic-ish timer that is safe on wasm32 (where `std::time::Instant` panics).
 #[derive(Clone, Copy)]
@@ -119,7 +125,90 @@ pub fn effective_scale(width_pt: f32, height_pt: f32, scale: f32) -> f32 {
 /// and reported as `Err((message, panicked))`.
 type Output = (u32, u32, Vec<u8>, Option<Arc<crate::text::PageText>>);
 
+/// Memory all display lists of one pool may hold together.
+pub const LIST_BUDGET: usize = if cfg!(target_pointer_width = "64") { 1536 << 20 } else { 256 << 20 };
+/// A list is not worth recording with less budget than this left.
+const MIN_LIST_BUDGET: usize = 16 << 20;
+
+/// One worker's display list: the page it last rendered tiles of.
+struct Lists<'a> {
+    total: Arc<AtomicUsize>,
+    page: Option<usize>,
+    /// `None` when recording failed (unsupported content or over budget): render directly.
+    list: Option<DisplayList<'a>>,
+    bytes: usize,
+}
+
+impl<'a> Lists<'a> {
+    fn new(total: Arc<AtomicUsize>) -> Self {
+        Self { total, page: None, list: None, bytes: 0 }
+    }
+
+    /// The list for `index`, recording it first for a tile request.
+    fn get(
+        &mut self,
+        index: usize,
+        page: &'a hayro::hayro_syntax::page::Page<'a>,
+        cache: &RenderCache<'a>,
+        settings: &InterpreterSettings,
+        tile: bool,
+    ) -> Option<&DisplayList<'a>> {
+        if self.page != Some(index) {
+            if !tile {
+                return None;
+            }
+            self.release();
+            self.page = Some(index);
+            let budget = LIST_BUDGET.saturating_sub(self.total.load(Ordering::Relaxed));
+            if budget >= MIN_LIST_BUDGET {
+                self.list = DisplayList::record(page, cache, settings, budget);
+                self.bytes = self.list.as_ref().map_or(0, |l| l.bytes());
+                self.total.fetch_add(self.bytes, Ordering::Relaxed);
+            }
+        }
+        self.list.as_ref()
+    }
+
+    fn release(&mut self) {
+        self.total.fetch_sub(self.bytes, Ordering::Relaxed);
+        self.bytes = 0;
+        self.list = None;
+        self.page = None;
+    }
+}
+
+impl Drop for Lists<'_> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Take the next request: the most urgent one, unless one of the next few is a tile of the page
+/// this worker already holds a display list for.
+fn next_request(queue: &mut Vec<RenderRequest>, listed: Option<usize>) -> Option<RenderRequest> {
+    if let Some(page) = listed {
+        let n = queue.len();
+        let near = (n.saturating_sub(8)..n)
+            .rev()
+            .find(|&i| queue.get(i).is_some_and(|r| r.page == page && r.tile.is_some() && r.kind == RequestKind::Pixels));
+        if let Some(i) = near {
+            return Some(queue.remove(i));
+        }
+    }
+    queue.pop()
+}
+
 fn render_page<'a>(pdf: &'a Pdf, cache: &RenderCache<'a>, settings: &InterpreterSettings, req: RenderRequest) -> Result<Output, (String, bool)> {
+    render_page_with(pdf, cache, settings, req, None)
+}
+
+fn render_page_with<'a>(
+    pdf: &'a Pdf,
+    cache: &RenderCache<'a>,
+    settings: &InterpreterSettings,
+    req: RenderRequest,
+    mut lists: Option<&mut Lists<'a>>,
+) -> Result<Output, (String, bool)> {
     if req.kind == RequestKind::Text {
         return match catch_unwind(AssertUnwindSafe(|| crate::text::extract_page(pdf, req.page, settings))) {
             Ok(Some(t)) => Ok((0, 0, Vec::new(), Some(Arc::new(t)))),
@@ -154,7 +243,11 @@ fn render_page<'a>(pdf: &'a Pdf, cache: &RenderCache<'a>, settings: &Interpreter
                 RenderSettings { x_scale: scale, y_scale: scale, bg_color: WHITE, ..Default::default() }
             }
         };
-        let pixmap = render(page, cache, settings, &rs);
+        let list = lists.as_mut().and_then(|l| l.get(req.page, page, cache, settings, req.tile.is_some()));
+        let pixmap = match list {
+            Some(list) => render_display_list(list, cache, &rs),
+            None => render(page, cache, settings, &rs),
+        };
         Ok((pixmap.width() as u32, pixmap.height() as u32, pixmap.data_as_u8_slice().to_vec(), None))
     }));
     match result {
@@ -213,7 +306,7 @@ pub(crate) fn panic_message(p: &Box<dyn std::any::Any + Send>) -> String {
 }
 
 /// How long one page may render before the pool gives up on it (the watchdog).
-pub const STUCK_AFTER: std::time::Duration = std::time::Duration::from_secs(20);
+pub const STUCK_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// State shared by the pool and its workers.
 #[derive(Default)]
@@ -226,6 +319,8 @@ struct Shared {
     /// Pages (and request kinds) the watchdog gave up on: answered with an error at once, so a
     /// pathological page cannot trap every worker in turn.
     stuck: Mutex<std::collections::HashSet<(usize, RequestKind)>>,
+    /// Bytes held by the workers' display lists (see [`LIST_BUDGET`]).
+    list_bytes: Arc<AtomicUsize>,
     /// Test hook: make one page slow.
     #[cfg(test)]
     slow_page: Mutex<Option<(usize, std::time::Duration)>>,
@@ -403,8 +498,9 @@ fn worker(id: usize, bytes: Arc<Vec<u8>>, config: RenderConfig, shared: Arc<Shar
     loop {
         let pdf = parse(&bytes, config.password.as_deref());
         let cache = RenderCache::new();
+        let mut lists = Lists::new(shared.list_bytes.clone());
         loop {
-            let next = lock(&shared.queue).pop();
+            let next = next_request(&mut lock(&shared.queue), lists.page);
             let Some(req) = next else {
                 if wake.recv().is_err() {
                     return; // pool dropped
@@ -434,7 +530,7 @@ fn worker(id: usize, bytes: Arc<Vec<u8>>, config: RenderConfig, shared: Arc<Shar
                 }
             }
             let r = match &pdf {
-                Some(pdf) => render_page(pdf, &cache, &settings, req),
+                Some(pdf) => render_page_with(pdf, &cache, &settings, req, Some(&mut lists)),
                 None => Err(("the document could not be parsed".into(), false)),
             };
             // If the watchdog cleared our slot meanwhile, it already answered for this request
@@ -852,11 +948,78 @@ trailer << /Root 1 0 R >>
         }
     }
 
+    /// Tiles replayed from a recorded display list match tiles interpreted directly, for clips,
+    /// strokes, text, a shading pattern and an inline image.
+    #[test]
+    fn display_list_tiles_match_direct_tiles() {
+        use super::*;
+        let content = "q 10 10 80 80 re W n 1 0 0 rg 0 0 100 100 re f Q \
+            0 0 1 RG 3 w 5 5 m 95 95 l S \
+            BT /F1 24 Tf 10 40 Td (Hi) Tj ET \
+            /Pattern cs /P1 scn 50 0 50 30 re f \
+            q 20 0 0 20 70 70 cm BI /W 2 /H 2 /CS /RGB /BPC 8 /F /AHx ID 00FF00FF0000 0000FFFFFF00> EI Q";
+        let pdf = format!(
+            "%PDF-1.7
+1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> /Pattern << /P1 6 0 R >> >> >> endobj
+4 0 obj << /Length {} >> stream
+{content}
+endstream endobj
+5 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj
+6 0 obj << /PatternType 2 /Shading << /ShadingType 2 /ColorSpace /DeviceRGB /Coords [50 0 100 0] /Function << /FunctionType 2 /Domain [0 1] /C0 [1 1 0] /C1 [0 1 1] /N 1 >> >> >> endobj
+trailer << /Root 1 0 R >>
+%%EOF",
+            content.len()
+        );
+        let bytes = Arc::new(pdf.into_bytes());
+        let pool = RenderPool::new(bytes.clone(), 1, RenderConfig::default());
+        let tiles: Vec<Tile> = (0..4u32).map(|i| Tile { x: (i % 2) * 150, y: (i / 2) * 150, w: 150, h: 150 }).collect();
+        pool.set_queue(tiles.iter().map(|t| RenderRequest { page: 0, kind: RequestKind::Pixels, tile: Some(*t), scale: 3.0, tag: 0 }).collect());
+        let mut got = Vec::new();
+        let t0 = std::time::Instant::now();
+        while got.len() < tiles.len() && t0.elapsed().as_secs() < 30 {
+            match pool.try_recv() {
+                Some(p) => got.push(p),
+                None => std::thread::sleep(std::time::Duration::from_millis(2)),
+            }
+        }
+        assert_eq!(got.len(), 4);
+        assert!(pool.shared.list_bytes.load(Ordering::Relaxed) > 0, "the page was recorded");
+        let mut direct = PageRenderer::new(bytes, RenderConfig::default());
+        for p in got {
+            let d = direct.render(p.request);
+            assert!(p.error.is_none() && d.error.is_none());
+            assert_eq!(d.rgba.len(), p.rgba.len());
+            let worst = d.rgba.iter().zip(&p.rgba).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+            assert!(worst <= 8, "tile {:?} differs by {worst}", p.request.tile);
+        }
+    }
+
+    /// A soft mask cannot be replayed: recording gives up and tiles render directly.
+    #[test]
+    fn display_list_falls_back_for_soft_masks() {
+        use super::*;
+        let cache = RenderCache::new();
+        let pdf = Pdf::new_with_password(Arc::new(SOFT_MASKED.to_vec()), "").ok();
+        let pages = pdf.as_ref().map(|p| p.pages());
+        let page = pages.and_then(|p| p.first()).expect("parses");
+        assert!(hayro::DisplayList::record(page, &cache, &InterpreterSettings::default(), 1 << 30).is_none());
+    }
+
     /// An alpha soft mask whose transparency group has no /CS (as Chrome writes gradient text)
     /// must still mask. Regression test for the vendored hayro-interpret patch.
     #[test]
     fn soft_mask_without_group_colour_space_is_applied() {
-        let pdf = b"%PDF-1.7
+        let pdf = SOFT_MASKED;
+        let mut r = PageRenderer::new(Arc::new(pdf.to_vec()), RenderConfig::default());
+        let p = r.render(RenderRequest { page: 0, kind: RequestKind::Pixels, tile: None, scale: 1.0, tag: 0 });
+        let px = |x: u32, y: u32| p.rgba[((y * p.width + x) * 4) as usize..][..4].to_vec();
+        assert_eq!(px(25, 50), vec![255, 0, 0, 255], "inside the mask");
+        assert_eq!(px(75, 50), vec![255, 255, 255, 255], "outside the mask");
+    }
+
+    const SOFT_MASKED: &[u8] = b"%PDF-1.7
 1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
 2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
 3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R /Resources << /ExtGState << /M 5 0 R >> >> >> endobj
@@ -869,10 +1032,4 @@ endstream endobj
 endstream endobj
 trailer << /Root 1 0 R >>
 %%EOF";
-        let mut r = PageRenderer::new(Arc::new(pdf.to_vec()), RenderConfig::default());
-        let p = r.render(RenderRequest { page: 0, kind: RequestKind::Pixels, tile: None, scale: 1.0, tag: 0 });
-        let px = |x: u32, y: u32| p.rgba[((y * p.width + x) * 4) as usize..][..4].to_vec();
-        assert_eq!(px(25, 50), vec![255, 0, 0, 255], "inside the mask");
-        assert_eq!(px(75, 50), vec![255, 255, 255, 255], "outside the mask");
-    }
 }

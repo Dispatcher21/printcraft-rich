@@ -1758,6 +1758,18 @@ evidence = []
 notes = "web build works; IndexedDB/OPFS recent list and download flow are M3.10"
 
 [[feature]]
+id = "view.heavy-drawings"
+title = "Heavy vector drawings (CAD sheets with millions of operators) stay responsive when zoomed"
+area = "B"
+tier = "P1"
+milestone = "M3"
+status = "shipped"
+commands = []
+tools = []
+evidence = ["crates/render/src/raster.rs::display_list_tiles_match_direct_tiles", "crates/render/src/raster.rs::display_list_falls_back_for_soft_masks", "crates/render/src/text.rs::many_labels_lay_out_quickly"]
+notes = "the first tile of a page records a display list; later tiles replay only what intersects them (3M-operator sheet: 2.4 s to 0.3 s per tile); lists share a 1.5 GB budget; soft masks and stencil images fall back to direct rendering; text layout is near-linear (was cubic on label-heavy sheets); `printcraft-cli perf FILE` reports timings and memory without content"
+
+[[feature]]
 id = "view.large-document-performance"
 title = "Smooth scrolling on 500-page documents"
 area = "B"

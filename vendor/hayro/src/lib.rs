@@ -60,6 +60,9 @@ use vello_cpu::color::palette::css::WHITE;
 use vello_cpu::{Level, Pixmap, RenderMode};
 
 mod renderer;
+/// PrintCraft patch: recorded display lists for fast tiled rendering of heavy pages.
+mod display_list;
+pub use display_list::{DisplayList, render_display_list};
 /// PrintCraft patch: exported for its regression test.
 pub use renderer::tiling_cell_scale;
 

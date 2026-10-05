@@ -206,7 +206,7 @@ impl Renderer {
         out
     }
 
-    fn draw_image(&mut self, image_data: ImageData, alpha_data: Option<LumaData>) {
+    pub(crate) fn draw_image(&mut self, image_data: ImageData, alpha_data: Option<LumaData>) {
         let cur_transform = *self.ctx.transform();
         let mut additional_transform = Affine::IDENTITY;
 
@@ -581,7 +581,7 @@ impl Renderer {
         clip_path
     }
 
-    fn stroke_path(
+    pub(crate) fn stroke_path(
         &mut self,
         path: &BezPath,
         transform: Affine,
@@ -602,7 +602,7 @@ impl Renderer {
         }
     }
 
-    fn fill_path(
+    pub(crate) fn fill_path(
         &mut self,
         path: &BezPath,
         transform: Affine,
