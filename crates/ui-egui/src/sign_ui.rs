@@ -21,6 +21,74 @@ pub struct DigitalIdEntry {
     pub issuer: String,
     pub email: String,
     pub expires: String,
+    /// Smart cards: what the certificate is for and the card it is on.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+}
+
+/// Whether a digital ID entry is on a smart card or token (`pkcs11:`), or in the Windows
+/// certificate store (`certstore:`): listed from the system each time, never saved.
+pub fn is_smart_card(path: &str) -> bool {
+    path.starts_with("pkcs11:") || path.starts_with("certstore:")
+}
+
+/// What a smart card scan found: entries for the list, the token identities, errors.
+#[cfg(not(target_arch = "wasm32"))]
+type ScanResult = (Vec<DigitalIdEntry>, Vec<sign::pkcs11::TokenIdentity>, Vec<String>);
+
+/// The smart card scan. Card readers can take seconds to answer, so the scan runs on a worker
+/// thread and the Sign with a Digital ID list fills in when it ends.
+#[derive(Default)]
+pub struct SmartCardScan {
+    #[cfg(not(target_arch = "wasm32"))]
+    rx: Option<std::sync::mpsc::Receiver<ScanResult>>,
+    /// The token identities the last scan found (signing uses them).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub tokens: Vec<sign::pkcs11::TokenIdentity>,
+    /// Why some smart cards couldn't be listed (shown quietly under the list).
+    pub notice: Option<String>,
+}
+
+impl SmartCardScan {
+    /// A scan is running.
+    pub fn pending(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.rx.is_some();
+        #[cfg(target_arch = "wasm32")]
+        false
+    }
+
+    /// The reader of `reference` has a PIN pad.
+    fn pin_pad(&self, reference: &str) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.tokens.iter().any(|t| t.reference == reference && t.pin_pad);
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = reference;
+            false
+        }
+    }
+}
+
+/// List the identities on every token `modules` see, and on Windows the certificate store.
+#[cfg(not(target_arch = "wasm32"))]
+fn scan(modules: &[PathBuf]) -> ScanResult {
+    let (ids, mut errors) = sign::pkcs11::identities_in(modules);
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut entries: Vec<DigitalIdEntry> =
+        ids.iter().map(|id| DigitalIdEntry { detail: id.description(), ..entry_for(&id.reference, &id.certificate) }).collect();
+    #[cfg(windows)]
+    match sign::certstore::identities() {
+        Ok(list) => {
+            for id in list.iter().filter(|id| !ids.iter().any(|t| t.certificate.raw == id.certificate.raw)) {
+                let detail = format!("{} · Windows certificate store", sign::pkcs11::usage(&id.certificate));
+                entries.push(DigitalIdEntry { detail, ..entry_for(&sign::certstore::reference(&id.certificate), &id.certificate) });
+            }
+        }
+        Err(e) => errors.push(format!("Windows certificate store: {e}")),
+    }
+    errors.dedup();
+    (entries, ids, errors)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,6 +230,36 @@ fn id_dir() -> Option<PathBuf> {
     crate::recovery::RecoveryStore::default_dir().and_then(|d| d.parent().map(|p| p.join("Digital IDs")))
 }
 
+/// A Windows certificate store identity by its `certstore:` reference (Windows asks the PIN).
+fn store_id(reference: &str) -> Result<DigitalId, String> {
+    #[cfg(windows)]
+    return sign::certstore::find(reference).map_err(|e| e.to_string());
+    #[cfg(not(windows))]
+    Err(format!("{reference}: the certificate store is only available on Windows"))
+}
+
+impl PrintCraftApp {
+    /// A smart card identity by its `pkcs11:` reference, logging in with `pin`.
+    fn token_id(&self, reference: &str, pin: &str) -> Result<DigitalId, String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let token = match self.smart_cards.tokens.iter().find(|t| t.reference == reference) {
+                Some(t) => t.clone(),
+                None => sign::pkcs11::find(reference, &self.token_modules()).map_err(|e| e.to_string())?,
+            };
+            if pin.is_empty() && !token.pin_pad {
+                return Err("Enter the card's PIN.".into());
+            }
+            Ok(token.digital_id((!pin.is_empty()).then_some(pin)))
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = pin;
+            Err(format!("{reference}: smart cards are not available in the browser"))
+        }
+    }
+}
+
 /// A Keychain identity by its `keychain:` reference.
 fn keychain_id(reference: &str) -> Result<DigitalId, String> {
     #[cfg(target_os = "macos")]
@@ -177,6 +275,7 @@ pub fn entry_for(path: &str, c: &Certificate) -> DigitalIdEntry {
         issuer: c.issuer.common_name().map(str::to_string).unwrap_or_else(|| c.issuer.display()),
         email: c.subject.email().unwrap_or("").to_string(),
         expires: format!("{:04}.{:02}.{:02}", c.not_after.year, c.not_after.month, c.not_after.day),
+        detail: String::new(),
     }
 }
 
@@ -184,6 +283,7 @@ impl PrintCraftApp {
     /// Start signing: the rectangle (or field) is known; show Sign with a Digital ID.
     pub fn start_signing(&mut self, page: usize, rect: Option<[f64; 4]>, field: Option<String>, certify: Option<u8>) {
         self.refresh_keychain_ids();
+        self.refresh_smart_card_ids();
         self.sign_draft = Some(SignDraft::new(page, rect, field, certify, self.digital_ids.len()));
         self.dialog = Some(crate::Dialog::Sign);
     }
@@ -202,6 +302,69 @@ impl PrintCraftApp {
                 Err(e) => self.notify(format!("The Keychain's digital IDs couldn't be listed: {e}")),
             }
         }
+    }
+
+    /// The PKCS #11 libraries to ask: the well-known ones present, and the one in Preferences.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn token_modules(&self) -> Vec<PathBuf> {
+        let mut modules = sign::pkcs11::default_modules();
+        let own = self.pkcs11_module.trim();
+        if !own.is_empty() && !modules.iter().any(|m| m == std::path::Path::new(own)) {
+            modules.insert(0, PathBuf::from(own));
+        }
+        modules
+    }
+
+    /// Start listing smart card identities in the background (if the app lists them and no
+    /// scan is running). The list keeps the last scan's entries until the new one ends.
+    pub fn refresh_smart_card_ids(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if !self.smart_card_ids || self.smart_cards.pending() {
+                return;
+            }
+            let modules = self.token_modules();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let spawned = std::thread::Builder::new().name("smart cards".into()).spawn(move || {
+                // A panic in the scan becomes a notice instead of a silent stop.
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scan(&modules)))
+                    .unwrap_or_else(|_| (Vec::new(), Vec::new(), vec!["the smart card scan stopped unexpectedly".into()]));
+                let _ = tx.send(r);
+            });
+            match spawned {
+                Ok(_) => self.smart_cards.rx = Some(rx),
+                Err(e) => self.smart_cards.notice = Some(format!("Smart cards couldn't be listed: {e}")),
+            }
+        }
+    }
+
+    /// Take the smart card scan's result if it has ended. Returns `true` while it runs.
+    pub fn poll_smart_cards(&mut self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let Some(rx) = self.smart_cards.rx.as_ref() else { return false };
+            let (entries, tokens, errors) = match rx.try_recv() {
+                Ok(r) => r,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return true,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => (Vec::new(), Vec::new(), vec!["the smart card scan stopped unexpectedly".into()]),
+            };
+            self.smart_cards.rx = None;
+            let selected = self.sign_draft.as_ref().and_then(|d| d.selected).and_then(|i| self.digital_ids.get(i)).map(|e| e.path.clone());
+            let was_empty = self.digital_ids.is_empty();
+            self.digital_ids.retain(|e| !is_smart_card(&e.path));
+            self.digital_ids.extend(entries);
+            self.smart_cards.tokens = tokens;
+            self.smart_cards.notice = (!errors.is_empty()).then(|| format!("Some smart cards couldn't be read: {}", errors.join("; ")));
+            let ids = &self.digital_ids;
+            if let Some(d) = self.sign_draft.as_mut() {
+                d.selected = selected.and_then(|p| ids.iter().position(|e| e.path == p)).or((!ids.is_empty()).then_some(0));
+                // Nothing was listed when signing started; a card was found: offer it.
+                if was_empty && !ids.is_empty() && d.step == SignStep::Configure && d.new_id == NewIdDraft::default() {
+                    d.step = SignStep::Choose;
+                }
+            }
+        }
+        false
     }
 
     /// Add a digital ID file to the list (or select it if it's there).
@@ -273,6 +436,10 @@ impl PrintCraftApp {
         let entry = d.selected.and_then(|i| self.digital_ids.get(i)).cloned().ok_or("Choose a digital ID.")?;
         let id = if entry.path.starts_with("keychain:") {
             keychain_id(&entry.path)?
+        } else if entry.path.starts_with("pkcs11:") {
+            self.token_id(&entry.path, &d.password)?
+        } else if entry.path.starts_with("certstore:") {
+            store_id(&entry.path)?
         } else {
             let bytes = std::fs::read(&entry.path).map_err(|e| format!("{}: {e}", entry.path))?;
             sign::pkcs12::open(&bytes, &d.password).map_err(|e| match e {
@@ -292,6 +459,8 @@ impl PrintCraftApp {
             ..SignOptions::default()
         };
         let signed = self.session.sign(doc_id, &id, opts).map_err(|e| e.to_string())?;
+        // The PIN (if any) goes with the ID.
+        drop(id);
         // Signing saves, as in Acrobat: choose where (a cancelled save cancels signing).
         let name = self.session.get(doc_id).map(|d| d.name.clone()).unwrap_or_default();
         let stem = name.trim_end_matches(".pdf").trim_end_matches(".PDF").to_string();
@@ -380,6 +549,11 @@ fn choose(ui: &mut egui::Ui, app: &mut PrintCraftApp, t: &Tokens) -> bool {
     title(ui, "Sign with a Digital ID");
     ui.label("Choose the digital ID that you want to use for signing:");
     ui.add_space(6.0);
+    let scanning = app.poll_smart_cards();
+    if scanning {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+    }
+    let notice = app.smart_cards.notice.clone();
     let ids = app.digital_ids.clone();
     let Some(d) = app.sign_draft.as_mut() else { return true };
     let mut close = false;
@@ -398,9 +572,16 @@ fn choose(ui: &mut egui::Ui, app: &mut PrintCraftApp, t: &Tokens) -> bool {
             ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
             icons::paint(ui, Rect::from_min_size(rect.min + vec2(10.0, 15.0), vec2(20.0, 20.0)), "badge-check", 18.0, t.accent);
             ui.painter().text(rect.min + vec2(40.0, 9.0), egui::Align2::LEFT_TOP, &e.name, theme::semibold(13.0), t.text);
+            let source = if e.path.starts_with("keychain:") {
+                "Keychain  ·  ".to_string()
+            } else if is_smart_card(&e.path) {
+                if e.detail.is_empty() { "Smart card  ·  ".to_string() } else { format!("Smart card  ·  {}  ·  ", e.detail) }
+            } else {
+                String::new()
+            };
             let sub = format!(
                 "{}{}Issued by: {}, Expires: {}",
-                if e.path.starts_with("keychain:") { "Keychain  ·  " } else { "" },
+                source,
                 if e.email.is_empty() { String::new() } else { format!("{}  ·  ", e.email) },
                 e.issuer,
                 e.expires
@@ -413,10 +594,18 @@ fn choose(ui: &mut egui::Ui, app: &mut PrintCraftApp, t: &Tokens) -> bool {
                 d.step = SignStep::SignAs;
             }
         }
-        if ids.is_empty() {
+        if ids.is_empty() && !scanning {
             ui.label(egui::RichText::new("No digital IDs yet.").color(t.text_muted));
         }
     });
+    if scanning {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(egui::RichText::new("Looking for smart cards…").small().color(t.text_muted));
+        });
+    } else if let Some(n) = notice {
+        ui.label(egui::RichText::new(n).small().color(t.text_muted));
+    }
     ui.add_space(10.0);
     ui.horizontal(|ui| {
         if widgets::pill_button(ui, "Configure New Digital ID", false).clicked() {
@@ -438,6 +627,9 @@ fn choose(ui: &mut egui::Ui, app: &mut PrintCraftApp, t: &Tokens) -> bool {
 
 fn configure(ui: &mut egui::Ui, app: &mut PrintCraftApp, t: &Tokens) -> bool {
     title(ui, "Configure a Digital ID for Signing");
+    if app.poll_smart_cards() {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+    }
     let Some(d) = app.sign_draft.as_mut() else { return true };
     let mut close = false;
     let mut go = false;
@@ -569,6 +761,9 @@ fn sign_as(ui: &mut egui::Ui, app: &mut PrintCraftApp, t: &Tokens) -> bool {
     };
     title(ui, &format!("{} as \"{}\"", if d.certify.is_some() { "Certify" } else { "Sign" }, entry.name));
     let in_keychain = entry.path.starts_with("keychain:");
+    let on_card = entry.path.starts_with("pkcs11:");
+    let in_store = entry.path.starts_with("certstore:");
+    let pin_pad = on_card && app.smart_cards.pin_pad(&entry.path);
     let mut close = false;
     let mut go = false;
     if d.rect.is_some() || d.field.is_some() {
@@ -615,6 +810,21 @@ fn sign_as(ui: &mut egui::Ui, app: &mut PrintCraftApp, t: &Tokens) -> bool {
             ui.label(
                 egui::RichText::new("The key is in the macOS Keychain, which may ask to allow PrintCraft to use it.").small().color(t.text_muted),
             );
+        } else if in_store {
+            ui.label("");
+            ui.label(egui::RichText::new("Windows will ask for your PIN.").small().color(t.text_muted));
+        } else if pin_pad {
+            ui.label("");
+            ui.label(egui::RichText::new("Enter the PIN on the card reader's keypad when it asks.").small().color(t.text_muted));
+        } else if on_card {
+            let l = ui.label("PIN");
+            let r = ui.add(egui::TextEdit::singleline(&mut d.password).password(true).desired_width(140.0)).labelled_by(l.id);
+            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                go = true;
+            }
+            ui.end_row();
+            ui.label("");
+            ui.label(egui::RichText::new("The key stays on the smart card. The card locks after several wrong PINs.").small().color(t.text_muted));
         } else {
             let l = ui.label("Digital ID password");
             let r = ui.add(egui::TextEdit::singleline(&mut d.password).password(true).desired_width(200.0)).labelled_by(l.id);
@@ -649,6 +859,10 @@ fn sign_as(ui: &mut egui::Ui, app: &mut PrintCraftApp, t: &Tokens) -> bool {
             Err(e) => {
                 if let Some(d) = app.sign_draft.as_mut() {
                     d.error = Some(e);
+                    // Don't keep a smart card PIN around after a failed try.
+                    if on_card {
+                        d.password.clear();
+                    }
                 }
             }
         }
@@ -986,4 +1200,32 @@ pub(crate) fn cert_viewer(ui: &mut egui::Ui, v: &mut CertViewer, trusted: &[Cert
 /// The text of an exported certificate (`.cer`, PEM).
 pub fn certificate_pem(c: &Certificate) -> String {
     sign::x509::to_pem(c)
+}
+
+/// Preferences ▸ Signing: the PKCS #11 library to ask for smart cards besides the usual ones.
+pub(crate) fn preferences_section(ui: &mut egui::Ui, app: &mut PrintCraftApp, t: &Tokens) {
+    ui.label(egui::RichText::new("Signing").font(theme::semibold(13.0)));
+    egui::Frame::new().fill(t.hover).corner_radius(CornerRadius::same(6)).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            let l = ui.label("Smart card library (PKCS #11)");
+            ui.add(egui::TextEdit::singleline(&mut app.pkcs11_module).hint_text("Optional").desired_width(260.0)).labelled_by(l.id);
+            #[cfg(not(target_arch = "wasm32"))]
+            if ui.button("Browse…").clicked()
+                && let Some(p) = rfd::FileDialog::new().add_filter("PKCS #11 library", &["so", "dylib", "dll"]).pick_file()
+            {
+                app.pkcs11_module = p.to_string_lossy().into_owned();
+            }
+        });
+        #[cfg(not(target_arch = "wasm32"))]
+        let found = sign::pkcs11::default_modules();
+        #[cfg(target_arch = "wasm32")]
+        let found: Vec<PathBuf> = Vec::new();
+        let text = if found.is_empty() {
+            "No smart card library was found in the usual places. Install OpenSC (or your card's middleware, such as ActivClient), or choose its PKCS #11 library here.".to_string()
+        } else {
+            format!("Also used: {}", found.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "))
+        };
+        ui.label(egui::RichText::new(text).small().color(t.text_muted));
+    });
 }

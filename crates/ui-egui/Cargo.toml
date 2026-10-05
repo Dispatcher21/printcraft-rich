@@ -39,3 +39,8 @@ printcraft-cos = { workspace = true }
 printcraft-model = { workspace = true }
 egui_kittest = { workspace = true, features = ["eframe", "wgpu"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+printcraft-sign = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# Writes a SoftHSM2 token for the smart card test (tests/signing.rs).
+cryptoki = "0.12"

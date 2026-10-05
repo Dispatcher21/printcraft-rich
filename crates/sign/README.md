@@ -29,8 +29,28 @@ for s in signatures(&doc, &bytes, &trust) {                                // li
   fill, comments, metadata, page content, document structure) under the DocMDP permissions.
   The verdict follows Acrobat: valid, unknown (intact but the identity isn't trusted) or invalid.
 
-Not yet: RFC 3161 timestamps, LTV (DSS/VRI, OCSP, CRL), FieldMDP locks, certificate security,
-OS key stores and PKCS #11 tokens.
+- **Keys held elsewhere** (`ExternalKey`: the private key never enters PrintCraft):
+  - `pkcs11` (native targets): smart cards such as a US DoD Common Access Card (CAC) or a PIV
+    card, and USB tokens, through the vendor's PKCS #11 library loaded at run time with
+    `cryptoki` (OpenSC's `opensc-pkcs11`, ActivClient's `acpkcs211.dll`, p11-kit's proxy;
+    `default_modules()` finds the usual install locations). `identities(module)` lists the
+    certificates without a PIN (a CAC's certificates are public objects); encryption-only
+    certificates (a CAC's Key Management certificate) are left out and the rest are labelled
+    "Digital Signature" (nonRepudiation) or "Authentication", so the right one can be picked.
+    `TokenIdentity::digital_id(pin)` signs on the card: log in (or use the reader's PIN pad),
+    `CKM_RSA_PKCS` over a `DigestInfo` built in software, or `CKM_ECDSA` over the digest with
+    the raw `r || s` re-encoded as DER. A wrong PIN is `SignError::WrongPin`. References are
+    `pkcs11:<SHA-256 of the certificate>`.
+  - `certstore` (Windows): certificates with a private key in CurrentUser\MY, smart cards
+    included, signing through CNG (Windows asks for the PIN). `certstore:<SHA-256>`.
+    Compile-checked only so far.
+  - `keychain` (macOS): Keychain identities through the Security framework.
+
+  `tests/pkcs11.rs` runs against a SoftHSM2 token (`apt-get install softhsm2`); without
+  SoftHSM2 it prints a note and passes. `tests/softhsm/mod.rs` builds the token and is shared
+  with the automation and UI tests.
+
+Not yet: RFC 3161 timestamps, LTV (DSS/VRI, OCSP, CRL), FieldMDP locks, certificate security.
 
 Oracles: poppler's `pdfsig` reports our signatures valid; OpenSSL reads our `.p12` files and
 verifies our CMS; `tests/data/openssl-signed.pdf` is a signature OpenSSL made, which we validate.

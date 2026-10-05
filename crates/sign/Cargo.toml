@@ -31,6 +31,14 @@ rc2 = "0.9"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 getrandom = "0.4"
+# PKCS #11 tokens and smart cards (CAC/PIV through OpenSC or ActivClient); the vendor library
+# is loaded at run time (Apache-2.0).
+cryptoki = "0.12"
+
+[target.'cfg(windows)'.dependencies]
+# Signing with certificates from the Windows certificate store, smart cards included
+# (MIT OR Apache-2.0).
+rustls-cng = { version = "0.7", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Signing with Keychain identities (MIT OR Apache-2.0).

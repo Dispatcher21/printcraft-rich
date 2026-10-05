@@ -342,6 +342,13 @@ pub struct PrintCraftApp {
     pub alt_draft: a11y_ui::AltDraft,
     /// List the macOS Keychain's signing identities among the digital IDs (the desktop app).
     pub keychain_ids: bool,
+    /// List smart card and token identities (PKCS #11, and on Windows the certificate store)
+    /// among the digital IDs (the desktop app; off in tests unless a test turns it on).
+    pub smart_card_ids: bool,
+    /// A PKCS #11 library to ask besides the well-known ones (Preferences ▸ Signing).
+    pub pkcs11_module: String,
+    /// The smart card scan (runs on a worker thread) and what it found.
+    pub smart_cards: sign_ui::SmartCardScan,
     pub cert_viewer: Option<sign_ui::CertViewer>,
     /// The last space audit.
     pub space_audit: Vec<printcraft_engine::optimize::SpaceUse>,
@@ -489,6 +496,9 @@ impl PrintCraftApp {
             a11y_skipped: Default::default(),
             alt_draft: Default::default(),
             keychain_ids: false,
+            smart_card_ids: false,
+            pkcs11_module: String::new(),
+            smart_cards: Default::default(),
             cert_viewer: None,
             space_audit: Vec::new(),
             combine_draft: Vec::new(),
@@ -818,8 +828,9 @@ impl PrintCraftApp {
             "signature": match &self.signature { Some(fill_sign::SavedSig::Drawn(s)) => Some(s), _ => None },
             "signature_text": match &self.signature { Some(fill_sign::SavedSig::Typed(t)) => Some(t), _ => None },
             "initials": self.initials,
-            // Keychain identities are read from macOS each time.
-            "digital_ids": self.digital_ids.iter().filter(|e| !e.path.starts_with("keychain:")).collect::<Vec<_>>(),
+            // Keychain and smart card identities are read from the system each time.
+            "digital_ids": self.digital_ids.iter().filter(|e| !e.path.starts_with("keychain:") && !sign_ui::is_smart_card(&e.path)).collect::<Vec<_>>(),
+            "pkcs11_module": self.pkcs11_module,
             "trusted": trusted,
             "custom_stamps": stamps_ui::encode(&self.custom_stamps),
             "javascript": self.session.javascript(),
@@ -853,6 +864,9 @@ impl PrintCraftApp {
         }
         if let Ok(ids) = serde_json::from_value::<Vec<DigitalIdEntry>>(v["digital_ids"].clone()) {
             self.digital_ids = ids;
+        }
+        if let Some(m) = v["pkcs11_module"].as_str() {
+            self.pkcs11_module = m.trim().to_string();
         }
         self.custom_stamps = stamps_ui::decode(&v["custom_stamps"]);
         self.custom_actions = actions_ui::decode(&v["actions"]);

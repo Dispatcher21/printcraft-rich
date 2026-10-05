@@ -4,15 +4,21 @@
 //!   primitives (RSA private-key operations use aws-lc-rs on native targets, ADR-0009).
 //! - [`pdf`]: signature fields in a document — listing and validating them, and signing
 //!   (PAdES B-B, `ETSI.CAdES.detached`) with an incremental save.
+//! - Keys held outside the app: [`pkcs11`] (smart cards such as a CAC, and USB tokens; native
+//!   targets), [`keychain`] (macOS) and [`certstore`] (the Windows certificate store).
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+#[cfg(windows)]
+pub mod certstore;
 pub mod cms;
 pub mod der;
 #[cfg(target_os = "macos")]
 pub mod keychain;
 pub mod keys;
 pub mod pdf;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod pkcs11;
 pub mod pkcs12;
 pub mod x509;
 
@@ -30,6 +36,8 @@ pub enum SignError {
     Unsupported(String),
     #[error("the password is incorrect")]
     WrongPassword,
+    #[error("the PIN is incorrect (the card locks after several wrong tries)")]
+    WrongPin,
     #[error("{0}")]
     Crypto(String),
     #[error("{0}")]
