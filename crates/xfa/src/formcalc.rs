@@ -608,11 +608,14 @@ fn err<T>(m: impl Into<String>) -> R<T> {
     Err(Flow::Error(m.into()))
 }
 
+/// A user function: parameter names and body.
+type FuncDef = Rc<(Vec<String>, Vec<Expr>)>;
+
 struct Eval<'h> {
     host: &'h mut Host,
     this: N,
     scopes: Vec<HashMap<String, V>>,
-    funcs: Vec<HashMap<String, Rc<(Vec<String>, Vec<Expr>)>>>,
+    funcs: Vec<HashMap<String, FuncDef>>,
     steps: u64,
     calls: usize,
 }
@@ -1462,7 +1465,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 
 /// `WordNum`: 123.45 → "One Hundred Twenty-three" (f=1 adds "Dollars", f=2 adds cents).
 fn word_num(x: f64, f: i64) -> String {
-    if !x.is_finite() || x < 0.0 || x >= 1e15 {
+    if !x.is_finite() || !(0.0..1e15).contains(&x) {
         return "*".repeat(10);
     }
     const ONES: [&str; 20] = [
@@ -1497,7 +1500,7 @@ fn word_num(x: f64, f: i64) -> String {
         if r > 0 {
             if r < 20 {
                 out.push(ONES.get(r as usize).unwrap_or(&"").to_string());
-            } else if r % 10 == 0 {
+            } else if r.is_multiple_of(10) {
                 out.push(TENS.get((r / 10) as usize).unwrap_or(&"").to_string());
             } else {
                 out.push(format!("{}-{}", TENS.get((r / 10) as usize).unwrap_or(&""), ONES.get((r % 10) as usize).unwrap_or(&"").to_lowercase()));

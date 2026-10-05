@@ -317,7 +317,14 @@ fn value_names(edit: &Edit, out: &mut Vec<String>) -> bool {
             true
         }
         Edit::ResetForm { .. } | Edit::ApplyScriptChanges { .. } => true,
-        Edit::Batch { edits, .. } => edits.iter().fold(false, |any, e| value_names(e, out) || any),
+        Edit::Batch { edits, .. } => {
+            // Every sub-edit's names, so no short-circuiting.
+            let mut any = false;
+            for e in edits {
+                any |= value_names(e, out);
+            }
+            any
+        }
         _ => false,
     }
 }

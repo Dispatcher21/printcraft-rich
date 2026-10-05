@@ -530,10 +530,7 @@ impl Host {
                         data.and_then(|p| merge::Data { tree: self.tree(), root: Some(self.live.data_root) }.find(&p)).map(|d| Val::Obj(Obj::Data(d)))
                     }
                     "oneOfChild" => None,
-                    _ => match self.child(o, name, Idx::Default, false).into_iter().next() {
-                        Some(c) => Some(Val::Obj(c)),
-                        None => None,
-                    },
+                    _ => self.child(o, name, Idx::Default, false).into_iter().next().map(Val::Obj),
                 }
             }
             Obj::Prop(n, path) => {
@@ -918,7 +915,7 @@ impl Host {
                     }
                     "isPropertySpecified" => {
                         let p = text(self, 0);
-                        Ok(Val::Bool(self.live.has_element(n, &[p.clone()]) || self.live.attr(n, &[], &p).is_some()))
+                        Ok(Val::Bool(self.live.has_element(n, std::slice::from_ref(&p)) || self.live.attr(n, &[], &p).is_some()))
                     }
                     "getAttribute" => {
                         let a = text(self, 0);
